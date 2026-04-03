@@ -56,14 +56,16 @@ def compute_agg_grad(j, theta_t_list, data):
     task = data['task']
     theta_j = theta_t_list[j]
 
-    neighbors = [l for l in range(m) if W[j, l] > 0]
+    grad_sum = np.zeros_like(theta_j)
+    for l in range(m):
+        if W[j, l] > 0:
+            if task == 'ranking':
+                g = rank_grad(theta_j, *data['precomputed_pairs'][l])
+            else:
+                g = aft_grad(theta_j, *data['precomputed_pairs'][l])
+            grad_sum += W[j, l] * g
 
-    if task == 'ranking':
-        grads = [rank_grad(theta_j, *data['precomputed_pairs'][l]) for l in neighbors]
-    else:
-        grads = [aft_grad(theta_j, *data['precomputed_pairs'][l]) for l in neighbors]
-
-    return np.mean(np.stack(grads, axis=0), axis=0).reshape(-1, 1)
+    return grad_sum
 
 def inner_admm(theta_t_list, agg_grad_list, H_rho_list, W,
                rho, W_inner, lam_t=0.0, project=False):
@@ -128,8 +130,8 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False):
                 data['precomputed_pairs'].append(aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma']))
 
     theta_t_local, theta_naive = init_all_nodes(data)
-    # 按照论文要求，将初始值设为 naive estimator (所有节点本地估计的均值)
-    theta_t = [theta_naive.copy() for _ in range(m)]
+    # 恢复为使用各节点本地估计作为初始值，以保证 consensus_gap 非零，内层 ADMM 正常工作
+    theta_t = [th.copy() for th in theta_t_local]
 
     history = {'rmse': [], 'consensus': []}
 

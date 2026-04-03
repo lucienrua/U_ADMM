@@ -113,7 +113,7 @@ def aft_hess_diag(theta, dX, dlogTt, r2, r, di, dj, n):
     de = dlogTt + (dX @ theta).flatten()
     z = de / r
     phi = sp_norm.pdf(z)
-    w = (di + dj) * phi / r2
+    w = (di + dj) * phi / r
     H = (dX.T * w) @ dX * 2.0 / (n * (n - 1))
     return float(np.linalg.eigvalsh(H).max()) + 1e-3
 

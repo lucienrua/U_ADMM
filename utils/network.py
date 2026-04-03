@@ -39,4 +39,16 @@ def generate_er_network(m, p_c):
         G.add_edges_from(new_edges)
 
     W = nx.to_numpy_array(G)
-    return G, W
+    
+    # Generate Metropolis-Hastings doubly stochastic weight matrix
+    degrees = np.sum(W, axis=1)
+    W_mh = np.zeros((m, m))
+    for i in range(m):
+        for j in range(m):
+            if i != j and W[i, j] > 0:
+                W_mh[i, j] = 1.0 / (max(degrees[i], degrees[j]) + 1.0)
+    
+    for i in range(m):
+        W_mh[i, i] = 1.0 - np.sum(W_mh[i, :])
+        
+    return G, W_mh

@@ -198,51 +198,49 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, alpha=1.0, verbose=Fals
                 from models.aft import aft_pairs
                 data['precomputed_pairs'].append(aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma']))
 
-    theta_t_local, theta_naive = init_all_nodes(data)
-    theta_t = [th.copy() for th in theta_t_local]
-    p_t = [np.zeros((p, 1)) for _ in range(m)]
+    best_ic = float('inf')
+    best_run = None
+    best_lam_global = None
 
-    history = {'rmse': [], 'consensus': [], 'debug': []}
+    for lam in lambda_candidates:
+        theta_t_local, theta_naive = init_all_nodes(data)
+        theta_t = [th.copy() for th in theta_t_local]
+        p_t = [np.zeros((p, 1)) for _ in range(m)]
 
-    def _record(th_list):
-        rmse = float(np.mean([np.linalg.norm(th_list[j] - theta_true) for j in range(m)]))
-        mat = np.hstack(th_list)
-        ce = float(np.mean(np.sum((mat - mat.mean(1, keepdims=True))**2, 0)))
-        history['rmse'].append(rmse)
-        history['consensus'].append(ce)
-        return rmse
+        history = {'rmse': [], 'consensus': [], 'debug': []}
 
-    r0 = _record(theta_t)
-    current_rho = rho
+        def _record(th_list):
+            rmse = float(np.mean([np.linalg.norm(th_list[j] - theta_true) for j in range(m)]))
+            mat = np.hstack(th_list)
+            ce = float(np.mean(np.sum((mat - mat.mean(1, keepdims=True))**2, 0)))
+            history['rmse'].append(rmse)
+            history['consensus'].append(ce)
+            return rmse
 
-    if verbose:
-        print(f'  [t=0 init]  RMSE={{r0:.6f}}')
+        r0 = _record(theta_t)
+        current_rho = rho
+        current_lam = lam
 
-    for t in range(T):
-        agg_grad_list = [compute_agg_grad(j, theta_t, data) for j in range(m)]
+        for t in range(T):
+            agg_grad_list = [compute_agg_grad(j, theta_t, data) for j in range(m)]
 
-        if task == 'ranking':
-            from models.ranking import rank_hess
-            H_rho_list = []
-            for j in range(m):
-                dX, S = data['precomputed_pairs'][j]
-                H_j = rank_hess(theta_t[j], dX, S)
-                rho_j = float(np.linalg.eigvalsh(H_j).max()) + 1e-3
-                H_rho_list.append(rho_j)
-        else:
-            from models.aft import aft_hess_diag
-            H_rho_list = []
-            for j in range(m):
-                dX, dlogTt, r2, r, di, dj, n_val = data['precomputed_pairs'][j]
-                rho_j = max(aft_hess_diag(theta_t[j], dX, dlogTt, r2, r, di, dj, n_val), 0.1)
-                H_rho_list.append(rho_j)
+            if task == 'ranking':
+                from models.ranking import rank_hess
+                H_rho_list = []
+                for j in range(m):
+                    dX, S = data['precomputed_pairs'][j]
+                    H_j = rank_hess(theta_t[j], dX, S)
+                    rho_j = float(np.linalg.eigvalsh(H_j).max()) + 1e-3
+                    H_rho_list.append(rho_j)
+            else:
+                from models.aft import aft_hess_diag
+                H_rho_list = []
+                for j in range(m):
+                    dX, dlogTt, r2, r, di, dj, n_val = data['precomputed_pairs'][j]
+                    rho_j = max(aft_hess_diag(theta_t[j], dX, dlogTt, r2, r, di, dj, n_val), 0.1)
+                    H_rho_list.append(rho_j)
 
-        best_ic = float('inf')
-        best_res = None
-        best_lam = None
-
-        for lam in lambda_candidates:
-            theta_tmp, p_tmp, _, debug_info = inner_admm(
+            theta_t, p_t, current_rho, debug_info = inner_admm(
                 theta_t_list=theta_t,
                 p_t_list=p_t,
                 agg_grad_list=agg_grad_list,
@@ -250,28 +248,34 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, alpha=1.0, verbose=Fals
                 W=W_adj,
                 rho=current_rho,
                 W_inner=W_inner,
-                lam_t=lam,
+                lam_t=current_lam,
                 project=(task == 'ranking')
             )
+
+            outer_debug = {
+                't': t,
+                'theta_t': [th.copy() for th in theta_t],
+                'lam_t': current_lam
+            }
+            history['debug'].append(outer_debug)
             
-            ic_val = compute_ic(theta_tmp, data, ic_type=ic_type)
-            if ic_val < best_ic:
-                best_ic = ic_val
-                best_res = (theta_tmp, p_tmp, debug_info)
-                best_lam = lam
+            # Step decay
+            if alpha != 1.0:
+                current_lam *= alpha
+                
+            r = _record(theta_t)
+            # if verbose: print(f'    [lam={lam:.4f}][t={t+1:2d}] RMSE={r:.6f}')
 
-        # Update with the best tracking results
-        theta_t, p_t, best_debug = best_res
-        
-        outer_debug = {
-            't': t,
-            'theta_t': [th.copy() for th in theta_t],
-            'lam_t': best_lam
-        }
-        history['debug'].append(outer_debug)
-        
-        r = _record(theta_t)
+        ic_val = compute_ic(theta_t, data, ic_type=ic_type)
         if verbose:
-            print(f'  [t={t+1:2d}]  RMSE={r:.6f}, best_lam={best_lam:.4f}, {ic_type.upper()}={best_ic:.4f}')
+            print(f'  [lam={lam:.4f}] Final RMSE={_record(theta_t):.4f}, rho={current_rho:.4f}, {ic_type.upper()}={ic_val:.4f}')
+            
+        if ic_val < best_ic:
+            best_ic = ic_val
+            best_run = (theta_t, theta_naive, history)
+            best_lam_global = lam
 
-    return theta_t, theta_naive, history
+    if verbose:
+        print(f'>>> Selected best_lam={best_lam_global:.4f} with {ic_type.upper()}={best_ic:.4f} <<<')
+        
+    return best_run

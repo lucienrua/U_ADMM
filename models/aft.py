@@ -20,7 +20,7 @@ def generate_noise(noise_type, size):
     else:
         return np.random.normal(0, 1, size)
 
-def generate_aft_data(m, n, p_prime, p, pc, cens_target=0.25, noise_type='gumbel', rng_seed=None):
+def generate_aft_data(m, n, p, pc, cens_target=0.25, noise_type='gumbel', rng_seed=None):
     """
     生成论文 Section 7.2.1 的 AFT（加速失效时间）仿真数据。
     数据生成模型：

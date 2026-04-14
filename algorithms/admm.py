@@ -73,7 +73,7 @@ def compute_agg_grad(j, theta_t_list, data):
     return grad_sum
 
 def inner_admm(theta_t_list, p_t_list, agg_grad_list, H_rho_list, W,
-               rho, W_inner, lam_t=0.0, project=False):
+               rho, W_inner, lam_t=0.0, project=False, adaptive_rho=True):
     """
     内层广义共识 ADMM（无球面投影，对应式 **3）。
     加入自适应 rho (Residual Balancing) 机制。
@@ -179,10 +179,7 @@ def compute_ic(theta_list, data, ic_type='bic'):
         ic = np.log(avg_loss) + (np.log(N_total) / N_total) * df
     return ic
 
-def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, alpha=1.0, verbose=False, adaptive_rho=True, lambda_candidates=None, ic_type='bic'):
-    if lambda_candidates is None or len(lambda_candidates) == 0:
-        lambda_candidates = [lam_t]
-    
+def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, adaptive_rho=True, lambda_candidates=None, ic_type='bic'):
     m, p = data['m'], data['p']
     W_adj = data['W']
     theta_true = data['theta_true']
@@ -192,37 +189,42 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, alpha=1.0, verbose=Fals
         data['precomputed_pairs'] = []
         for j in range(m):
             if task == 'ranking':
-                from models.ranking import ranking_pairs
                 data['precomputed_pairs'].append(ranking_pairs(data['X'][j], data['Y'][j]))
             else:
-                from models.aft import aft_pairs
                 data['precomputed_pairs'].append(aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma']))
 
     theta_t_local, theta_naive = init_all_nodes(data)
+    # 恢复为使用各节点本地估计作为初始值，以保证 consensus_gap 非零，内层 ADMM 正常工作
     theta_t = [th.copy() for th in theta_t_local]
-    p_t = [np.zeros((p, 1)) for _ in range(m)]
+    p_t = [np.zeros((p, 1)) for _ in range(m)] # 初始化对偶变量
 
     history = {'rmse': [], 'consensus': [], 'debug': []}
 
     def _record(th_list):
-        rmse = float(np.mean([np.linalg.norm(th_list[j] - theta_true) for j in range(m)]))
+        rmse = float(np.mean([np.linalg.norm(th_list[j] - theta_true)
+                               for j in range(m)]))
         mat = np.hstack(th_list)
-        ce = float(np.mean(np.sum((mat - mat.mean(1, keepdims=True))**2, 0)))
+        ce = float(np.mean(
+            np.sum((mat - mat.mean(1, keepdims=True))**2, 0)
+        ))
         history['rmse'].append(rmse)
         history['consensus'].append(ce)
         return rmse
 
     r0 = _record(theta_t)
+    if verbose:
+        print(f'  [t=0 init]  RMSE={r0:.6f}')
+
+    current_lam = lam_t
     current_rho = rho
 
-    if verbose:
-        print(f'  [t=0 init]  RMSE={{r0:.6f}}')
-
     for t in range(T):
-        agg_grad_list = [compute_agg_grad(j, theta_t, data) for j in range(m)]
+        agg_grad_list = [
+            compute_agg_grad(j, theta_t, data)
+            for j in range(m)
+        ]
 
         if task == 'ranking':
-            from models.ranking import rank_hess
             H_rho_list = []
             for j in range(m):
                 dX, S = data['precomputed_pairs'][j]
@@ -230,48 +232,86 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, alpha=1.0, verbose=Fals
                 rho_j = float(np.linalg.eigvalsh(H_j).max()) + 1e-3
                 H_rho_list.append(rho_j)
         else:
-            from models.aft import aft_hess_diag
             H_rho_list = []
             for j in range(m):
                 dX, dlogTt, r2, r, di, dj, n_val = data['precomputed_pairs'][j]
                 rho_j = max(aft_hess_diag(theta_t[j], dX, dlogTt, r2, r, di, dj, n_val), 0.1)
                 H_rho_list.append(rho_j)
 
-        best_ic = float('inf')
-        best_res = None
-        best_lam = None
-
-        for lam in lambda_candidates:
-            theta_tmp, p_tmp, _, debug_info = inner_admm(
-                theta_t_list=theta_t,
-                p_t_list=p_t,
-                agg_grad_list=agg_grad_list,
-                H_rho_list=H_rho_list,
-                W=W_adj,
-                rho=current_rho,
-                W_inner=W_inner,
-                lam_t=lam,
-                project=(task == 'ranking')
-            )
+        if lambda_candidates is not None and len(lambda_candidates) > 0:
+            best_ic = float('inf')
+            best_theta_t = None
+            best_p_t = None
+            best_rho = None
+            best_debug_info = None
+            best_lam = None
             
-            ic_val = compute_ic(theta_tmp, data, ic_type=ic_type)
-            if ic_val < best_ic:
-                best_ic = ic_val
-                best_res = (theta_tmp, p_tmp, debug_info)
-                best_lam = lam
+            for lam_cand in lambda_candidates:
+                cand_theta_t, cand_p_t, cand_rho, cand_debug_info = inner_admm(
+                    theta_t_list = theta_t,
+                    p_t_list = p_t,
+                    agg_grad_list = agg_grad_list,
+                    H_rho_list = H_rho_list,
+                    W = W_adj,
+                    rho = current_rho,
+                    W_inner = W_inner,
+                    lam_t = lam_cand,
+                    project = (task == 'ranking'),
+                    adaptive_rho = adaptive_rho
+                )
+                
+                ic_val = compute_ic(cand_theta_t, data, ic_type=ic_type)
+                if ic_val < best_ic:
+                    best_ic = ic_val
+                    best_theta_t = cand_theta_t
+                    best_p_t = cand_p_t
+                    best_rho = cand_rho
+                    best_debug_info = cand_debug_info
+                    best_lam = lam_cand
+            
+            theta_t = best_theta_t
+            p_t = best_p_t
+            current_rho = best_rho
+            debug_info = best_debug_info
+            current_lam = best_lam
 
-        # Update with the best tracking results
-        theta_t, p_t, best_debug = best_res
+        else:
+            theta_t, p_t, current_rho, debug_info = inner_admm(
+                theta_t_list = theta_t,
+                p_t_list = p_t,
+                agg_grad_list = agg_grad_list,
+                H_rho_list = H_rho_list,
+                W = W_adj,
+                rho = current_rho,
+                W_inner = W_inner,
+                lam_t = current_lam,
+                project = (task == 'ranking'),
+                adaptive_rho = adaptive_rho
+            )
         
+        # Save outer iteration debug info
         outer_debug = {
             't': t,
             'theta_t': [th.copy() for th in theta_t],
-            'lam_t': best_lam
+            'p_t': [p.copy() for p in p_t],
+            'agg_grad_list': [g.copy() for g in agg_grad_list],
+            'H_rho_list': H_rho_list.copy(),
+            'lam_t': current_lam,
+            'inner_debug': debug_info
         }
+        if lambda_candidates is not None and len(lambda_candidates) > 0:
+            outer_debug['ic_val'] = best_ic
+            
         history['debug'].append(outer_debug)
-        
+
         r = _record(theta_t)
         if verbose:
-            print(f'  [t={t+1:2d}]  RMSE={r:.6f}, best_lam={best_lam:.4f}, {ic_type.upper()}={best_ic:.4f}')
+            if lambda_candidates is not None and len(lambda_candidates) > 0:
+                print(f'  [t={t+1:2d}]  RMSE={r:.6f}, best_lam={current_lam:.4f}, rho={current_rho:.4f}, {ic_type.upper()}={best_ic:.4f}')
+            else:
+                print(f'  [t={t+1:2d}]  RMSE={r:.6f}, lam_t={current_lam:.4f}, rho={current_rho:.4f}')
+            
+        if lambda_candidates is None or len(lambda_candidates) == 0:
+            current_lam *= alpha
 
     return theta_t, theta_naive, history

@@ -73,7 +73,7 @@ def compute_agg_grad(j, theta_t_list, data):
     return grad_sum
 
 def inner_admm(theta_t_list, p_t_list, agg_grad_list, H_rho_list, W,
-               rho, W_inner, lam_t=0.0, project=False, adaptive_rho=True):
+               rho, W_inner, lam_t=0.0, project=False):
     """
     内层广义共识 ADMM（无球面投影，对应式 **3）。
     加入自适应 rho (Residual Balancing) 机制。
@@ -179,7 +179,7 @@ def compute_ic(theta_list, data, ic_type='bic'):
         ic = np.log(avg_loss) + (np.log(N_total) / N_total) * df
     return ic
 
-def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, adaptive_rho=True, lambda_candidates=None, ic_type='bic'):
+def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, lambda_candidates=None, ic_type='bic'):
     m, p = data['m'], data['p']
     W_adj = data['W']
     theta_true = data['theta_true']
@@ -192,6 +192,18 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, adaptive
                 data['precomputed_pairs'].append(ranking_pairs(data['X'][j], data['Y'][j]))
             else:
                 data['precomputed_pairs'].append(aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma']))
+
+    # 基于 Proposition 1 设置各节点的理论步长 rho_j
+    # rho_j > lambda_max(n^-1 * X^T * X)
+    theoretical_rho_list = []
+    for j in range(m):
+        X_j = data['X'][j]
+        n_j = X_j.shape[0]
+        # 计算本地样本协方差矩阵 n^-1 * X^T * X
+        cov_j = (X_j.T @ X_j) / n_j
+        # 理论下界：最大特征值 + 1e-3
+        rho_j = float(np.linalg.eigvalsh(cov_j).max()) + 1e-3
+        theoretical_rho_list.append(rho_j)
 
     theta_t_local, theta_naive = init_all_nodes(data)
     # 恢复为使用各节点本地估计作为初始值，以保证 consensus_gap 非零，内层 ADMM 正常工作
@@ -214,6 +226,7 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, adaptive
     r0 = _record(theta_t)
     if verbose:
         print(f'  [t=0 init]  RMSE={r0:.6f}')
+        print(f'  [Theory Rho] Mean={np.mean(theoretical_rho_list):.4f}, Max={np.max(theoretical_rho_list):.4f}')
 
     current_lam = lam_t
     current_rho = rho
@@ -224,19 +237,8 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, adaptive
             for j in range(m)
         ]
 
-        if task == 'ranking':
-            H_rho_list = []
-            for j in range(m):
-                dX, S = data['precomputed_pairs'][j]
-                H_j = rank_hess(theta_t[j], dX, S)
-                rho_j = float(np.linalg.eigvalsh(H_j).max()) + 1e-3
-                H_rho_list.append(rho_j)
-        else:
-            H_rho_list = []
-            for j in range(m):
-                dX, dlogTt, r2, r, di, dj, n_val = data['precomputed_pairs'][j]
-                rho_j = max(aft_hess_diag(theta_t[j], dX, dlogTt, r2, r, di, dj, n_val), 0.1)
-                H_rho_list.append(rho_j)
+        # 使用基于理论下界的固定步长
+        H_rho_list = theoretical_rho_list
 
         if lambda_candidates is not None and len(lambda_candidates) > 0:
             best_ic = float('inf')
@@ -256,8 +258,7 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, adaptive
                     rho = current_rho,
                     W_inner = W_inner,
                     lam_t = lam_cand,
-                    project = (task == 'ranking'),
-                    adaptive_rho = adaptive_rho
+                    project = (task == 'ranking')
                 )
                 
                 ic_val = compute_ic(cand_theta_t, data, ic_type=ic_type)
@@ -285,8 +286,7 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, adaptive
                 rho = current_rho,
                 W_inner = W_inner,
                 lam_t = current_lam,
-                project = (task == 'ranking'),
-                adaptive_rho = adaptive_rho
+                project = (task == 'ranking')
             )
         
         # Save outer iteration debug info
@@ -311,7 +311,5 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, adaptive
             else:
                 print(f'  [t={t+1:2d}]  RMSE={r:.6f}, lam_t={current_lam:.4f}, rho={current_rho:.4f}')
             
-        if lambda_candidates is None or len(lambda_candidates) == 0:
-            current_lam *= alpha
 
     return theta_t, theta_naive, history

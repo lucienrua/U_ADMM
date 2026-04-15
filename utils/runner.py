@@ -53,29 +53,34 @@ def run_single_ranking(seed, params):
     theta_true = d_rank['theta_true']
     X, Y, quantiles = d_rank['X'], d_rank['Y'], d_rank['quantiles']
     
+    # 【核心修复】统一执行一次热启动初始化，所有算法共享起点
+    theta0_list, theta_naive = init_all_nodes(d_rank)
+    
     result = {'seed': seed, 'noise_type': params['noise_type']}
     
+    lambda_candidates = params.get('lambda_candidates', [0.1, 0.05, 0.01, 0.005, 0.001])
+    ic_type = params.get('ic_type', 'bic')
+
     if params.get('run_proposed', True):
         t0 = time.time()
-        lambda_candidates = params.get('lambda_candidates', [0.1, 0.05, 0.01, 0.005, 0.001])
-        ic_type = params.get('ic_type', 'bic')
         theta_u_r, theta_n_r, hist_r = run_u_admm(
             d_rank, T=params['T'], W_inner=params['W_inner'], 
             rho=params['rho'], verbose=False,
             lambda_candidates=lambda_candidates,
-            ic_type=ic_type
+            ic_type=ic_type,
+            theta0_list=theta0_list  # 传递热启动
         )
         t_uadmm = time.time() - t0
         result['Proposed'] = get_metrics_ranking(theta_u_r[0], theta_true, X, Y, quantiles, t_uadmm)
         result['Proposed']['hist_rmse'] = hist_r['rmse']
         result['Proposed']['theta_hat'] = theta_u_r[0].flatten().tolist()
         
-        # Avg MR is a byproduct of Proposed initialization
-        result['Avg'] = get_metrics_ranking(theta_n_r, theta_true, X, Y, quantiles, 0.0)
+        # Avg MR (Naive) 直接取自热启动平均值，已包含在 init_all_nodes 的 theta_naive 中
+        result['Avg'] = get_metrics_ranking(theta_naive, theta_true, X, Y, quantiles, 0.0)
         
     if params.get('run_local', True):
         t0 = time.time()
-        theta0_list, _ = init_all_nodes(d_rank)
+        # 直接使用预先算好的 theta0_list
         t_local = time.time() - t0
         local_rmses, local_maes, local_accs = [], [], []
         for th in theta0_list:
@@ -92,16 +97,15 @@ def run_single_ranking(seed, params):
         
     if params.get('run_baselines', True):
         t0 = time.time()
-        lambda_candidates = params.get('lambda_candidates', [0.1, 0.05, 0.01, 0.005, 0.001])
-        ic_type = params.get('ic_type', 'bic')
-        theta_global = run_global_u_erm(d_rank, lambda_candidates=lambda_candidates, ic_type=ic_type)
+        # 传递 theta_naive 作为 Pooled 的初始化点
+        theta_global = run_global_u_erm(d_rank, lambda_candidates=lambda_candidates, ic_type=ic_type, init_theta=theta_naive)
         t_global = time.time() - t0
         result['Pooled'] = get_metrics_ranking(theta_global, theta_true, X, Y, quantiles, t_global)
         
     if params.get('run_baselines', True):
         t0 = time.time()
-        # D-subGD iterations = T * W_inner to ensure fair computation comparison
-        theta_dgd = run_dgd(d_rank, T=params['T'] * params['W_inner'], lr=0.1)
+        # 传递 theta0_list 作为 D-subGD 的初始分布
+        theta_dgd = run_dgd(d_rank, T=params['T'] * params['W_inner'], lr=0.1, theta_init_list=theta0_list)
         t_dgd = time.time() - t0
         result['D-subGD'] = get_metrics_ranking(theta_dgd, theta_true, X, Y, quantiles, t_dgd)
         
@@ -116,28 +120,32 @@ def run_single_aft(seed, params):
     
     theta_true = d_aft['theta_true']
     
+    # 统一热启动
+    theta0_list, theta_naive = init_all_nodes(d_aft)
+    
     result = {'seed': seed, 'noise_type': params['noise_type']}
     
+    lambda_candidates = params.get('lambda_candidates', [0.1, 0.05, 0.01, 0.005, 0.001])
+    ic_type = params.get('ic_type', 'bic')
+
     if params.get('run_proposed', True):
         t0 = time.time()
-        lambda_candidates = params.get('lambda_candidates', [0.1, 0.05, 0.01, 0.005, 0.001])
-        ic_type = params.get('ic_type', 'bic')
         theta_u_a, theta_n_a, hist_a = run_u_admm(
             d_aft, T=params['T'], W_inner=params['W_inner'], 
             rho=params['rho'], verbose=False,
             lambda_candidates=lambda_candidates,
-            ic_type=ic_type
+            ic_type=ic_type,
+            theta0_list=theta0_list
         )
         t_uadmm = time.time() - t0
         result['Proposed'] = get_metrics_aft(theta_u_a[0], theta_true, d_aft['X'], t_uadmm)
         result['Proposed']['hist_rmse'] = hist_a['rmse']
         result['Proposed']['theta_hat'] = theta_u_a[0].flatten().tolist()
         
-        result['Avg'] = get_metrics_aft(theta_n_a, theta_true, d_aft['X'], 0.0)
+        result['Avg'] = get_metrics_aft(theta_naive, theta_true, d_aft['X'], 0.0)
         
     if params.get('run_local', True):
         t0 = time.time()
-        theta0_list, _ = init_all_nodes(d_aft)
         t_local = time.time() - t0
         local_rmses, local_maes = [], []
         for th in theta0_list:
@@ -152,15 +160,13 @@ def run_single_aft(seed, params):
         
     if params.get('run_baselines', True):
         t0 = time.time()
-        lambda_candidates = params.get('lambda_candidates', [0.1, 0.05, 0.01, 0.005, 0.001])
-        ic_type = params.get('ic_type', 'bic')
-        theta_global = run_global_u_erm(d_aft, lambda_candidates=lambda_candidates, ic_type=ic_type)
+        theta_global = run_global_u_erm(d_aft, lambda_candidates=lambda_candidates, ic_type=ic_type, init_theta=theta_naive)
         t_global = time.time() - t0
         result['Pooled'] = get_metrics_aft(theta_global, theta_true, d_aft['X'], t_global)
         
     if params.get('run_baselines', True):
         t0 = time.time()
-        theta_dgd = run_dgd(d_aft, T=params['T'] * params['W_inner'], lr=0.1)
+        theta_dgd = run_dgd(d_aft, T=params['T'] * params['W_inner'], lr=0.1, theta_init_list=theta0_list)
         t_dgd = time.time() - t0
         result['D-subGD'] = get_metrics_aft(theta_dgd, theta_true, d_aft['X'], t_dgd)
         

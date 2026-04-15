@@ -45,17 +45,15 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
             theta_tmp = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=lam)
             
             loss_val = lfn(theta_tmp)
-            if task == 'ranking':
-                total_loss = loss_val * len(S)
-            else:
-                total_loss = loss_val * (n_val * (n_val - 1) / 2)
-                
             df = np.sum(np.abs(theta_tmp) > 1e-4)
             
+            # loss_val 本身即为平均损失 (avg_loss)
+            avg_loss = loss_val if loss_val > 0 else 1e-10
+            
             if ic_type.lower() == 'aic':
-                ic_val = 2 * total_loss + 2 * df
+                ic_val = np.log(avg_loss) + (2.0 / N_total) * df
             else:
-                ic_val = 2 * total_loss + df * np.log(N_total)
+                ic_val = np.log(avg_loss) + (np.log(N_total) / N_total) * df
             
             if ic_val < best_ic:
                 best_ic = ic_val

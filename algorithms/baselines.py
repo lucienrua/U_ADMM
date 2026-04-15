@@ -4,9 +4,10 @@ from models.ranking import rank_grad, rank_loss, ranking_pairs
 from models.aft import aft_grad, aft_loss, aft_pairs
 from algorithms.admm import local_gd
 
-def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic'):
+def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None):
     """
     Pooled MR (Global U-ERM): 将所有本地数据汇总到一台机器上，利用全部数据计算估计值。
+    init_theta: 外部热启动参数 (p,1)，若为 None 则使用默认初始化。
     """
     task = data['task']
     p = data['p']
@@ -18,7 +19,8 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
         
         gfn = lambda th: rank_grad(th, dX, S)
         lfn = lambda th: rank_loss(th, dX, S)
-        init = np.ones((p, 1)) / np.sqrt(p)
+        # 热启动：优先使用传入的 init_theta，否则回退到归一化均匀向量
+        init = init_theta.copy() if init_theta is not None else np.ones((p, 1)) / np.sqrt(p)
         project = True
         
     elif task == 'aft':
@@ -31,7 +33,7 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
         
         gfn = lambda th: aft_grad(th, dX, dlogTt, r2, r, di, dj, n_val)
         lfn = lambda th: aft_loss(th, dX, dlogTt, r2, r, di, dj, n_val)
-        init = np.zeros((p, 1))
+        init = init_theta.copy() if init_theta is not None else np.zeros((p, 1))
         project = False
         
     if lambda_candidates is not None:
@@ -63,9 +65,10 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
     else:
         return local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=0.0)
 
-def run_dgd(data, T=50, lr=0.1):
+def run_dgd(data, T=50, lr=0.1, theta_init_list=None):
     """
     D-subGD (Decentralized Gradient Descent): 节点通过本地梯度下降和网络通信协作求解。
+    theta_init_list: 外部热启动参数列表（与 m 等长），若为 None 则使用默认初始化。
     """
     m = data['m']
     p = data['p']
@@ -82,8 +85,10 @@ def run_dgd(data, T=50, lr=0.1):
             dX, dlogTt, r2, r, di, dj, n_val = aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'])
             local_pairs.append((dX, dlogTt, r2, r, di, dj, n_val))
             
-    # 初始化
-    if task == 'ranking':
+    # 初始化：优先使用热启动，否则使用默认初始值
+    if theta_init_list is not None:
+        theta = [th.copy() for th in theta_init_list]
+    elif task == 'ranking':
         theta = [np.ones((p, 1)) / np.sqrt(p) for _ in range(m)]
     else:
         theta = [np.zeros((p, 1)) for _ in range(m)]

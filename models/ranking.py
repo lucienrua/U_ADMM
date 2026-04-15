@@ -42,7 +42,8 @@ def generate_ranking_data(m, n, p_prime, p, pc, noise_type='normal', rng_seed=No
     # p为总特征维数，p_prime 为前置非零特征的数量
     v = np.zeros((p, 1), dtype=float)
     v[:p_prime, 0] = 1.0
-    theta_true = v
+    # 归一化到单位球面：估计量受 ||theta||_2=1 约束，真实参数须保持一致量纲
+    theta_true = v / np.linalg.norm(v)
 
     # 协方差矩阵：对角元为 1，非对角元为 0.5
     Sigma = 0.5 * np.ones((p, p))

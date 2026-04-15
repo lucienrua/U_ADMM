@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.optimize import minimize as scipy_minimize
 from utils.math_utils import soft_threshold, _proj_sphere
 from models.ranking import rank_grad, rank_loss, rank_hess, ranking_pairs
 from models.aft import aft_grad, aft_loss, aft_hess_diag, aft_pairs
@@ -30,24 +31,59 @@ def local_gd(grad_fn, loss_fn, init_theta, n_iter=300, lr_init=0.5, project=Fals
         theta = cand
     return theta
 
+def _slsqp_ranking_init(dX, S, p, maxiter=500):
+    """
+    用 SLSQP 在单位球面约束下精确最小化 Ranking Logistic 损失。
+    相比一阶 local_gd 具有更快的收敛速度和更稳健的初始估计。
+    """
+    def obj_grad(x_flat):
+        th = x_flat.reshape(-1, 1)
+        return rank_loss(th, dX, S), rank_grad(th, dX, S).flatten()
+
+    x0 = np.ones(p) / np.sqrt(p)
+    sphere_constraint = {
+        'type': 'eq',
+        'fun': lambda x: np.dot(x, x) - 1.0,
+        'jac': lambda x: 2.0 * x
+    }
+    result = scipy_minimize(
+        obj_grad, x0, method='SLSQP', jac=True,
+        constraints=sphere_constraint,
+        options={'maxiter': maxiter, 'ftol': 1e-10, 'disp': False}
+    )
+    return _proj_sphere(result.x.reshape(-1, 1))  # 数值安全投影
+
+
 def init_all_nodes(data):
     m, p = data['m'], data['p']
     task = data['task']
-    theta0_list = []
 
+    # 若 precomputed_pairs 不存在则自动计算（支持从 notebook 直接调用）
+    if 'precomputed_pairs' not in data:
+        data['precomputed_pairs'] = []
+        for j in range(m):
+            if task == 'ranking':
+                data['precomputed_pairs'].append(
+                    ranking_pairs(data['X'][j], data['Y'][j])
+                )
+            else:
+                data['precomputed_pairs'].append(
+                    aft_pairs(data['X'][j], data['logTt'][j],
+                              data['delta'][j], data['Sigma'])
+                )
+
+    theta0_list = []
     for j in range(m):
         if task == 'ranking':
             dX, S = data['precomputed_pairs'][j]
-            gfn = lambda th, dX=dX, S=S: rank_grad(th, dX, S)
-            lfn = lambda th, dX=dX, S=S: rank_loss(th, dX, S)
-            init = np.ones((p, 1)) / np.sqrt(p)
+            # SLSQP：精确球面约束求解，替代一阶梯度下降
+            th = _slsqp_ranking_init(dX, S, p)
         else:
             dX, dlogTt, r2, r, di, dj, n_val = data['precomputed_pairs'][j]
             gfn = lambda th, dX=dX, dlogTt=dlogTt, r2=r2, r=r, di=di, dj=dj, n=n_val: aft_grad(th, dX, dlogTt, r2, r, di, dj, n)
             lfn = lambda th, dX=dX, dlogTt=dlogTt, r2=r2, r=r, di=di, dj=dj, n=n_val: aft_loss(th, dX, dlogTt, r2, r, di, dj, n)
             init = np.zeros((p, 1))
-
-        th = local_gd(gfn, lfn, init, n_iter=300, lr_init=0.5, project=(task == 'ranking'))
+            th = local_gd(gfn, lfn, init, n_iter=300, lr_init=0.5, project=False)
         theta0_list.append(th)
 
     theta_naive = np.mean(np.hstack(theta0_list), axis=1, keepdims=True)
@@ -179,7 +215,8 @@ def compute_ic(theta_list, data, ic_type='bic'):
         ic = np.log(avg_loss) + (np.log(N_total) / N_total) * df
     return ic
 
-def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, lambda_candidates=None, ic_type='bic'):
+def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
+               lambda_candidates=None, ic_type='bic', theta0_list=None):
     m, p = data['m'], data['p']
     W_adj = data['W']
     theta_true = data['theta_true']
@@ -193,7 +230,17 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, lambda_c
             else:
                 data['precomputed_pairs'].append(aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma']))
 
-    # 基于 Proposition 1 设置各节点的理论步长 rho_j
+    # 支持通过 theta0_list 传入外部热启动参数
+    if theta0_list is not None:
+        theta_t = [th.copy() for th in theta0_list]
+        theta_naive = np.mean(np.hstack(theta0_list), axis=1, keepdims=True)
+        if task == 'ranking':
+            theta_naive = _proj_sphere(theta_naive)
+    else:
+        theta_t_local, theta_naive = init_all_nodes(data)
+        theta_t = [th.copy() for th in theta_t_local]
+
+    # 基于 Proposition 1 预计算各节点理论步长（循环外固定，避免逐迭代重算）
     # rho_j > lambda_max(n^-1 * X^T * X)
     theoretical_rho_list = []
     for j in range(m):
@@ -205,10 +252,8 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False, lambda_c
         rho_j = float(np.linalg.eigvalsh(cov_j).max()) + 1e-3
         theoretical_rho_list.append(rho_j)
 
-    theta_t_local, theta_naive = init_all_nodes(data)
-    # 恢复为使用各节点本地估计作为初始值，以保证 consensus_gap 非零，内层 ADMM 正常工作
-    theta_t = [th.copy() for th in theta_t_local]
-    p_t = [np.zeros((p, 1)) for _ in range(m)] # 初始化对偶变量
+    p_t = [np.zeros((p, 1)) for _ in range(m)]  # 初始化对偶变量
+
 
     history = {'rmse': [], 'consensus': [], 'debug': []}
 

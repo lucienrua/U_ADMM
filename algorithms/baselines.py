@@ -38,6 +38,7 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
         
     if lambda_candidates is not None:
         best_theta = None
+        best_lam = None
         best_ic = float('inf')
         N_total = sum(data['X'][j].shape[0] for j in range(data['m']))
         
@@ -58,10 +59,11 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
             if ic_val < best_ic:
                 best_ic = ic_val
                 best_theta = theta_tmp
+                best_lam = lam
                 
-        return best_theta
+        return best_theta, best_lam
     else:
-        return local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=0.0)
+        return local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=0.0), 0.0
 
 def run_dgd(data, T=50, lr=0.1, theta_init_list=None):
     """

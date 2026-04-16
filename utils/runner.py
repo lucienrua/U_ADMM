@@ -105,7 +105,7 @@ def run_single_ranking(seed, params):
     if params.get('run_baselines', True):
         t0 = time.time()
         # 传递 theta0_list 作为 D-subGD 的初始分布
-        theta_dgd = run_dgd(d_rank, T=params['T'] * params['W_inner'], lr=0.1, theta_init_list=theta0_list)
+        theta_dgd = run_dgd(d_rank, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=theta0_list)
         t_dgd = time.time() - t0
         result['D-subGD'] = get_metrics_ranking(theta_dgd, theta_true, X, Y, quantiles, t_dgd)
         
@@ -166,7 +166,7 @@ def run_single_aft(seed, params):
         
     if params.get('run_baselines', True):
         t0 = time.time()
-        theta_dgd = run_dgd(d_aft, T=params['T'] * params['W_inner'], lr=0.1, theta_init_list=theta0_list)
+        theta_dgd = run_dgd(d_aft, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=theta0_list)
         t_dgd = time.time() - t0
         result['D-subGD'] = get_metrics_aft(theta_dgd, theta_true, d_aft['X'], t_dgd)
         

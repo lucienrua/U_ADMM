@@ -4,13 +4,14 @@ from models.ranking import rank_grad, rank_loss, ranking_pairs
 from models.aft import aft_grad, aft_loss, aft_pairs
 from algorithms.admm import local_gd
 
-def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None):
+def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False):
     """
     Pooled MR (Global U-ERM): 将所有本地数据汇总到一台机器上，利用全部数据计算估计值。
     init_theta: 外部热启动参数 (p,1)，若为 None 则使用默认初始化。
     """
     task = data['task']
     p = data['p']
+    theta_true = data.get('theta_true', None) if return_history else None
     
     if task == 'ranking':
         X_all = np.vstack(data['X'])
@@ -38,12 +39,15 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
         
     if lambda_candidates is not None:
         best_theta = None
-        best_lam = None
         best_ic = float('inf')
+        best_history = None
         N_total = sum(data['X'][j].shape[0] for j in range(data['m']))
         
         for lam in lambda_candidates:
-            theta_tmp = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=lam)
+            if return_history:
+                theta_tmp, hist_tmp = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=lam, theta_true=theta_true)
+            else:
+                theta_tmp = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=lam)
             
             loss_val = lfn(theta_tmp)
             df = np.sum(np.abs(theta_tmp) > 1e-4)
@@ -59,13 +63,18 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
             if ic_val < best_ic:
                 best_ic = ic_val
                 best_theta = theta_tmp
-                best_lam = lam
+                if return_history:
+                    best_history = hist_tmp
                 
-        return best_theta, best_lam
+        if return_history:
+            return best_theta, best_history
+        return best_theta
     else:
-        return local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=0.0), 0.0
+        if return_history:
+            return local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=0.0, theta_true=theta_true)
+        return local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=0.0)
 
-def run_dgd(data, T=50, lr=0.1, theta_init_list=None):
+def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_init_list=None, return_history=False):
     """
     D-subGD (Decentralized Gradient Descent): 节点通过本地梯度下降和网络通信协作求解。
     theta_init_list: 外部热启动参数列表（与 m 等长），若为 None 则使用默认初始化。
@@ -74,6 +83,7 @@ def run_dgd(data, T=50, lr=0.1, theta_init_list=None):
     p = data['p']
     W = data['W']
     task = data['task']
+    theta_true = data.get('theta_true', None) if return_history else None
     
     # 预计算本地 pairs 以加速
     local_pairs = []
@@ -87,37 +97,97 @@ def run_dgd(data, T=50, lr=0.1, theta_init_list=None):
             
     # 初始化：优先使用热启动，否则使用默认初始值
     if theta_init_list is not None:
-        theta = [th.copy() for th in theta_init_list]
+        init_theta = [th.copy() for th in theta_init_list]
     elif task == 'ranking':
-        theta = [np.ones((p, 1)) / np.sqrt(p) for _ in range(m)]
+        init_theta = [np.ones((p, 1)) / np.sqrt(p) for _ in range(m)]
     else:
-        theta = [np.zeros((p, 1)) for _ in range(m)]
+        init_theta = [np.zeros((p, 1)) for _ in range(m)]
         
-    # 迭代
-    for t in range(T):
-        theta_new = []
-        for j in range(m):
-            # 1. Consensus step (网络通信)
-            th_j = np.zeros((p, 1))
-            for k in range(m):
-                if W[j, k] > 0:
-                    th_j += W[j, k] * theta[k]
-            
-            # 2. Local Gradient step
-            if task == 'ranking':
-                dX, S = local_pairs[j]
-                g = rank_grad(th_j, dX, S)
-            else:
-                dX, dlogTt, r2, r, di, dj, n_val = local_pairs[j]
-                g = aft_grad(th_j, dX, dlogTt, r2, r, di, dj, n_val)
-                
-            th_j = th_j - lr * g
-            
-            if task == 'ranking':
-                th_j = _proj_sphere(th_j)
-                
-            theta_new.append(th_j)
-        theta = theta_new
+    if lambda_candidates is not None:
+        from algorithms.admm import compute_ic
+        from utils.math_utils import soft_threshold
+        best_theta = None
+        best_ic = float('inf')
+        best_history = None
         
-    # 返回平均值作为最终估计
-    return np.mean(theta, axis=0)
+        for lam in lambda_candidates:
+            theta = [th.copy() for th in init_theta]
+            hist_tmp = {'rmse': []}
+            if return_history and theta_true is not None:
+                hist_tmp['rmse'].append(float(np.mean([np.linalg.norm(th_iter - theta_true) for th_iter in theta])))
+            for t in range(T):
+                theta_new = []
+                for j in range(m):
+                    # 1. Consensus step (网络通信)
+                    th_j = np.zeros((p, 1))
+                    for k in range(m):
+                        if W[j, k] > 0:
+                            th_j += W[j, k] * theta[k]
+                    
+                    # 2. Local Gradient step
+                    if task == 'ranking':
+                        dX, S = local_pairs[j]
+                        g = rank_grad(th_j, dX, S)
+                    else:
+                        dX, dlogTt, r2, r, di, dj, n_val = local_pairs[j]
+                        g = aft_grad(th_j, dX, dlogTt, r2, r, di, dj, n_val)
+                        
+                    th_j = th_j - lr * g
+                    
+                    if lam > 0:
+                        th_j = soft_threshold(th_j, lr * lam)
+                    
+                    if task == 'ranking':
+                        th_j = _proj_sphere(th_j)
+                        
+                    theta_new.append(th_j)
+                theta = theta_new
+                if return_history and theta_true is not None:
+                    hist_tmp['rmse'].append(float(np.mean([np.linalg.norm(th_iter - theta_true) for th_iter in theta])))
+                
+            ic_val = compute_ic(theta, data, ic_type=ic_type)
+            if ic_val < best_ic:
+                best_ic = ic_val
+                best_theta = theta
+                if return_history:
+                    best_history = hist_tmp
+                
+        if return_history:
+            return np.mean(best_theta, axis=0), best_history
+        return np.mean(best_theta, axis=0)
+    else:
+        from utils.math_utils import soft_threshold
+        theta = [th.copy() for th in init_theta]
+        hist_tmp = {'rmse': []}
+        if return_history and theta_true is not None:
+            hist_tmp['rmse'].append(float(np.mean([np.linalg.norm(th_iter - theta_true) for th_iter in theta])))
+        for t in range(T):
+            theta_new = []
+            for j in range(m):
+                # 1. Consensus step (网络通信)
+                th_j = np.zeros((p, 1))
+                for k in range(m):
+                    if W[j, k] > 0:
+                        th_j += W[j, k] * theta[k]
+                
+                # 2. Local Gradient step
+                if task == 'ranking':
+                    dX, S = local_pairs[j]
+                    g = rank_grad(th_j, dX, S)
+                else:
+                    dX, dlogTt, r2, r, di, dj, n_val = local_pairs[j]
+                    g = aft_grad(th_j, dX, dlogTt, r2, r, di, dj, n_val)
+                    
+                th_j = th_j - lr * g
+                
+                if task == 'ranking':
+                    th_j = _proj_sphere(th_j)
+                    
+                theta_new.append(th_j)
+            theta = theta_new
+            if return_history and theta_true is not None:
+                hist_tmp['rmse'].append(float(np.mean([np.linalg.norm(th_iter - theta_true) for th_iter in theta])))
+            
+        if return_history:
+            return np.mean(theta, axis=0), hist_tmp
+        return np.mean(theta, axis=0)

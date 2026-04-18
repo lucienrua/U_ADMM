@@ -18,18 +18,19 @@ def generate_noise(noise_type, size):
     else:
         return np.random.normal(0, 1, size)
 
-def generate_ranking_data(m, n, p_prime, p, pc, noise_type='normal', rng_seed=None):
+def generate_ranking_data(m, n, p_prime, p, pc, noise_type='normal', rng_seed=None, noise_scale=1.0):
     """
     生成问题一的数据
     Parameters
     ----------
-    m        : 节点数
-    n        : 每节点样本量
-    p_prime  : 非零特征数量
-    p        : 特征维数
-    pc       : ER 网络密度
-    noise_type: 噪声类型 ('normal', 'exp', 'cauchy', 't1', 't3')
-    rng_seed : 可选随机种子
+    m          : 节点数
+    n          : 每节点样本量
+    p_prime    : 非零特征数量
+    p          : 特征维数
+    pc         : ER 网络密度
+    noise_type : 噪声类型 ('normal', 'exp', 'cauchy', 't1', 't3')
+    rng_seed   : 可选随机种子
+    noise_scale: 噪声缩放系数，用于调节重尾噪声下的信噪比 (默认 1.0)
 
     Returns
     -------
@@ -51,7 +52,8 @@ def generate_ranking_data(m, n, p_prime, p, pc, noise_type='normal', rng_seed=No
 
     # 用 50000 个先验样本估计全局分位点（使五个类别等频）
     Xp = np.random.multivariate_normal(np.zeros(p), Sigma, 50_000)
-    tp = Xp @ theta_true.flatten() + generate_noise(noise_type, 50_000)
+    # 【修改处 1】：在估计分位点的全局数据生成时，乘以 noise_scale
+    tp = Xp @ theta_true.flatten() + generate_noise(noise_type, 50_000) * noise_scale
     quantiles = np.percentile(tp, [20, 40, 60, 80])  # 四个切点 t1,...,t4
 
     # 生成 ER 网络
@@ -61,7 +63,8 @@ def generate_ranking_data(m, n, p_prime, p, pc, noise_type='normal', rng_seed=No
     X_list, Y_list = [], []
     for _ in range(m):
         Xj = np.random.multivariate_normal(np.zeros(p), Sigma, n)  # (n, p)
-        tj = Xj @ theta_true.flatten() + generate_noise(noise_type, n) # 连续分数
+        # 【修改处 2】：在生成各节点实际的连续分数时，乘以 noise_scale
+        tj = Xj @ theta_true.flatten() + generate_noise(noise_type, n) * noise_scale 
         # searchsorted 实现分段函数 J：返回 {1,2,3,4,5}
         Yj = np.searchsorted(quantiles, tj, side='right') + 1       # (n,)
         X_list.append(Xj)

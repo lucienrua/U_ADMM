@@ -118,8 +118,8 @@ def compute_agg_grad(j, theta_t_list, data):
 def inner_admm(theta_t_list, p_t_list, agg_grad_list, H_rho_list, W,
                rho, W_inner, lam_t=0.0, project=False):
     """
-    内层广义共识 ADMM（无球面投影，对应式 **3）。
-    加入自适应 rho (Residual Balancing) 机制。
+    内层广义共识 ADMM
+    加入自适应 rho (Residual Balancing) 机制，实现免调参的极速收敛。
     """
     m = W.shape[0]
     p = theta_t_list[0].shape[0]
@@ -139,8 +139,8 @@ def inner_admm(theta_t_list, p_t_list, agg_grad_list, H_rho_list, W,
         'inner_theta': [],
         'inner_numerator': [],
         'consensus_gap': [],
-        'prim_res': None,
-        'dual_res': None,
+        'prim_res': [],  # 记录每步的原始残差
+        'dual_res': [],  # 记录每步的对偶残差
         'rho_after': rho
     }
 
@@ -166,14 +166,11 @@ def inner_admm(theta_t_list, p_t_list, agg_grad_list, H_rho_list, W,
         for j in range(m):
             sum_nb = sum(theta_w[k] for k in nb[j]) if nb[j] else np.zeros((p, 1))
 
-            # 正确的 Proximal Jacobi 迭代分子：
-            # H_rho_list[j] * theta_t_list[j] 是 Proximal 锚点，保证子问题有界且强凸
-            # 2.0 * rho * sum_nb 是邻居的拉扯力
             numerator = (
-                    H_rho_list[j] * theta_w[j]  # 必须使用内层变量作为近端锚点
+                    H_rho_list[j] * theta_w[j]  # 使用内层变量作为近端锚点
                     - agg_grad_list[j]
                     - p_w[j]
-                    + rho * (dg[j] * theta_w[j] + sum_nb)  # 对应理论中的 rho * sum(theta_j + theta_k)
+                    + rho * (dg[j] * theta_w[j] + sum_nb)
             )
             numerators.append(numerator.copy())
             z_j = omega[j] * numerator
@@ -187,6 +184,39 @@ def inner_admm(theta_t_list, p_t_list, agg_grad_list, H_rho_list, W,
         theta_w = theta_new
         debug_info['inner_theta'].append([th.copy() for th in theta_w])
         debug_info['inner_numerator'].append(numerators)
+        
+        # --- 3. Residual Balancing (残差平衡机制) ---
+        prim_res_sq = 0.0
+        dual_res_sq = 0.0
+        for j in range(m):
+            # 原始残差：当前最新参数的邻居分歧度
+            gap_j = sum(theta_w[j] - theta_w[k] for k in nb[j]) if nb[j] else np.zeros((p, 1))
+            prim_res_sq += np.sum(gap_j ** 2)
+            
+            # 对偶残差：本地参数在内循环前后的变化量近似
+            dual_res_sq += np.sum((rho * dg[j] * (theta_w[j] - theta_prev[j])) ** 2)
+            
+        prim_res = np.sqrt(prim_res_sq)
+        dual_res = np.sqrt(dual_res_sq)
+        
+        debug_info['prim_res'].append(prim_res)
+        debug_info['dual_res'].append(dual_res)
+        
+        # 动态调整 rho
+        mu = 10.0
+        tau = 1.1  # 使用 1.1 平滑调节，防止网络极度稀疏时发生剧烈震荡
+        
+        rho_changed = False
+        if prim_res > mu * dual_res:
+            rho = rho * tau
+            rho_changed = True
+        elif dual_res > mu * prim_res:
+            rho = rho / tau
+            rho_changed = True
+            
+        # 惩罚因子一旦改变，必须严格重算依赖于它的 omega 参数
+        if rho_changed:
+            omega = [1.0 / (H_rho_list[j] + 2.0 * rho * dg[j]) for j in range(m)]
             
     debug_info['rho_after'] = rho
 
@@ -299,21 +329,34 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
             best_rho = None
             best_debug_info = None
             best_lam = None
+            sorted_lambdas = sorted(lambda_candidates, reverse=True)
             
-            for lam_cand in lambda_candidates:
+# 2. 建立流动的内层热启动变量，初始值赋为外循环的起点
+            current_theta_inner = [th.copy() for th in theta_t]
+            current_p_inner = [p_copy.copy() for p_copy in p_t]
+            current_rho_inner = current_rho
+            
+            for lam_cand in sorted_lambdas:
+                # 3. 将 inner_admm 的输入替换为流动的热启动变量
                 cand_theta_t, cand_p_t, cand_rho, cand_debug_info = inner_admm(
-                    theta_t_list = theta_t,
-                    p_t_list = p_t,
+                    theta_t_list = current_theta_inner,  # <--- 使用上一个 lam 收敛的解
+                    p_t_list = current_p_inner,          # <--- 使用上一个 lam 的对偶变量
                     agg_grad_list = agg_grad_list,
                     H_rho_list = H_rho_list,
                     W = W_adj,
-                    rho = current_rho,
+                    rho = current_rho_inner,             # <--- 继承动态平衡后的 rho
                     W_inner = W_inner,
                     lam_t = lam_cand,
                     project = (task == 'ranking')
                 )
                 
+                # 4. 立即用当前 lam 的结果更新流动变量，喂给下一个更小的 lam
+                current_theta_inner = cand_theta_t
+                current_p_inner = cand_p_t
+                current_rho_inner = cand_rho
+                
                 ic_val = compute_ic(cand_theta_t, data, ic_type=ic_type)
+                
                 if ic_val < best_ic:
                     best_ic = ic_val
                     best_theta_t = cand_theta_t

@@ -97,17 +97,22 @@ def run_single_ranking(seed, params):
         
     if params.get('run_baselines', True):
         t0 = time.time()
+        total_iters = params['T'] * params['W_inner']
         # 传递 theta_naive 作为 Pooled 的初始化点
-        theta_global = run_global_u_erm(d_rank, lambda_candidates=lambda_candidates, ic_type=ic_type, init_theta=theta_naive)
+        theta_global, hist_global = run_global_u_erm(d_rank, n_iter=total_iters, lambda_candidates=lambda_candidates, ic_type=ic_type, init_theta=theta_naive, return_history=True)
         t_global = time.time() - t0
         result['Pooled'] = get_metrics_ranking(theta_global, theta_true, X, Y, quantiles, t_global)
+        result['Pooled']['hist_rmse'] = hist_global['rmse']
+        result['Pooled']['theta_hat'] = theta_global.flatten().tolist()
         
     if params.get('run_baselines', True):
         t0 = time.time()
         # 传递 theta0_list 作为 D-subGD 的初始分布
-        theta_dgd = run_dgd(d_rank, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=theta0_list)
+        theta_dgd, hist_dgd = run_dgd(d_rank, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=theta0_list, return_history=True)
         t_dgd = time.time() - t0
         result['D-subGD'] = get_metrics_ranking(theta_dgd, theta_true, X, Y, quantiles, t_dgd)
+        result['D-subGD']['hist_rmse'] = hist_dgd['rmse']
+        result['D-subGD']['theta_hat'] = theta_dgd.flatten().tolist()
         
     return result
 
@@ -160,14 +165,19 @@ def run_single_aft(seed, params):
         
     if params.get('run_baselines', True):
         t0 = time.time()
-        theta_global = run_global_u_erm(d_aft, lambda_candidates=lambda_candidates, ic_type=ic_type, init_theta=theta_naive)
+        total_iters = params['T'] * params['W_inner']
+        theta_global, hist_global = run_global_u_erm(d_aft, n_iter=total_iters, lambda_candidates=lambda_candidates, ic_type=ic_type, init_theta=theta_naive, return_history=True)
         t_global = time.time() - t0
         result['Pooled'] = get_metrics_aft(theta_global, theta_true, d_aft['X'], t_global)
+        result['Pooled']['hist_rmse'] = hist_global['rmse']
+        result['Pooled']['theta_hat'] = theta_global.flatten().tolist()
         
     if params.get('run_baselines', True):
         t0 = time.time()
-        theta_dgd = run_dgd(d_aft, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=theta0_list)
+        theta_dgd, hist_dgd = run_dgd(d_aft, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=theta0_list, return_history=True)
         t_dgd = time.time() - t0
         result['D-subGD'] = get_metrics_aft(theta_dgd, theta_true, d_aft['X'], t_dgd)
+        result['D-subGD']['hist_rmse'] = hist_dgd['rmse']
+        result['D-subGD']['theta_hat'] = theta_dgd.flatten().tolist()
         
     return result

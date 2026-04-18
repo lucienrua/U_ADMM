@@ -4,10 +4,10 @@ from models.ranking import rank_grad, rank_loss, ranking_pairs
 from models.aft import aft_grad, aft_loss, aft_pairs
 from algorithms.admm import local_gd
 
-def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False):
+def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False, tol=1e-5):
     """
-    Pooled MR (Global U-ERM): 将所有本地数据汇总到一台机器上，利用全部数据计算估计值。
-    init_theta: 外部热启动参数 (p,1)，若为 None 则使用默认初始化。
+    Pooled MR (Global U-ERM): 将所有本地数据汇总到一台机器上。
+    引入正则化路径 (降序排列) + 连续热启动 + 双阶段解耦。
     """
     task = data['task']
     p = data['p']
@@ -20,7 +20,6 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
         
         gfn = lambda th: rank_grad(th, dX, S)
         lfn = lambda th: rank_loss(th, dX, S)
-        # 热启动：优先使用传入的 init_theta，否则回退到归一化均匀向量
         init = init_theta.copy() if init_theta is not None else np.ones((p, 1)) / np.sqrt(p)
         project = True
         
@@ -37,22 +36,26 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
         init = init_theta.copy() if init_theta is not None else np.zeros((p, 1))
         project = False
         
-    if lambda_candidates is not None:
-        best_theta = None
+    if lambda_candidates is not None and len(lambda_candidates) > 0:
         best_ic = float('inf')
-        best_history = None
+        best_lam = 0.0
         N_total = sum(data['X'][j].shape[0] for j in range(data['m']))
         
-        for lam in lambda_candidates:
-            if return_history:
-                theta_tmp, hist_tmp = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=lam, theta_true=theta_true)
-            else:
-                theta_tmp = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=lam)
+        # 核心改造 1：强制降序排列 lambda_candidates
+        sorted_lambdas = sorted(lambda_candidates, reverse=True)
+        # 核心改造 2：建立流动的热启动起点
+        current_init_theta = init.copy()
+        
+        # --- 阶段一：极速调参寻找最优 lambda ---
+        for lam in sorted_lambdas:
+            # 开启提前终止 (如果 local_gd 支持 tol) 进行极速收敛，不记录 history
+            theta_tmp = local_gd(gfn, lfn, current_init_theta, n_iter=n_iter, lr_init=lr, project=project, lam=lam)
+            
+            # 核心改造 3：用当前收敛的参数更新流动起点，喂给下一个更小的 lam
+            current_init_theta = theta_tmp.copy()
             
             loss_val = lfn(theta_tmp)
             df = np.sum(np.abs(theta_tmp) > 1e-4)
-            
-            # loss_val 本身即为平均损失 (avg_loss)
             avg_loss = loss_val if loss_val > 0 else 1e-10
             
             if ic_type.lower() == 'aic':
@@ -62,22 +65,23 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
             
             if ic_val < best_ic:
                 best_ic = ic_val
-                best_theta = theta_tmp
-                if return_history:
-                    best_history = hist_tmp
-                
-        if return_history:
-            return best_theta, best_history
-        return best_theta
+                best_lam = lam
     else:
-        if return_history:
-            return local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=0.0, theta_true=theta_true)
-        return local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=0.0)
+        best_lam = 0.0
 
-def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_init_list=None, return_history=False):
+    # --- 阶段二：画图阶段 (使用全局最优 lambda 严格跑满 n_iter 轮) ---
+    if return_history:
+        # 回退到原始起点 init，严格跑满并记录 history
+        best_theta, best_history = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=best_lam, theta_true=theta_true)
+        return best_theta, best_history
+    else:
+        best_theta = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=best_lam)
+        return best_theta
+
+def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_init_list=None, return_history=False, tol=1e-4):
     """
-    D-subGD (Decentralized Gradient Descent): 节点通过本地梯度下降和网络通信协作求解。
-    theta_init_list: 外部热启动参数列表（与 m 等长），若为 None 则使用默认初始化。
+    D-subGD (Decentralized Subgradient Descent)
+    引入降序热启动与提前终止的双阶段调参架构，完美兼容 L1 近端截断与球面投影。
     """
     m = data['m']
     p = data['p']
@@ -95,7 +99,7 @@ def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_ini
             dX, dlogTt, r2, r, di, dj, n_val = aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'])
             local_pairs.append((dX, dlogTt, r2, r, di, dj, n_val))
             
-    # 初始化：优先使用热启动，否则使用默认初始值
+    # 初始化：优先使用热启动
     if theta_init_list is not None:
         init_theta = [th.copy() for th in theta_init_list]
     elif task == 'ranking':
@@ -103,22 +107,29 @@ def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_ini
     else:
         init_theta = [np.zeros((p, 1)) for _ in range(m)]
         
-    if lambda_candidates is not None:
+    if lambda_candidates is not None and len(lambda_candidates) > 0:
         from algorithms.admm import compute_ic
         from utils.math_utils import soft_threshold
-        best_theta = None
-        best_ic = float('inf')
-        best_history = None
         
-        for lam in lambda_candidates:
-            theta = [th.copy() for th in init_theta]
-            hist_tmp = {'rmse': []}
-            if return_history and theta_true is not None:
-                hist_tmp['rmse'].append(float(np.mean([np.linalg.norm(th_iter - theta_true) for th_iter in theta])))
-            for t in range(T):
+        best_ic = float('inf')
+        best_lam = 0.0
+        
+        # 核心改造 1：降序排列候选列表
+        sorted_lambdas = sorted(lambda_candidates, reverse=True)
+        # 核心改造 2：维护流动的网络参数起点
+        current_theta_init = [th.copy() for th in init_theta]
+        
+        # --- 阶段一：极速调参寻找最优 lambda ---
+        for lam_cand in sorted_lambdas:
+            theta = [th.copy() for th in current_theta_init]
+            
+            for t in range(1, T + 1):
+                lr_t = lr / np.sqrt(t) 
                 theta_new = []
+                max_diff = 0.0
+                
                 for j in range(m):
-                    # 1. Consensus step (网络通信)
+                    # 1. Consensus step
                     th_j = np.zeros((p, 1))
                     for k in range(m):
                         if W[j, k] > 0:
@@ -132,62 +143,77 @@ def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_ini
                         dX, dlogTt, r2, r, di, dj, n_val = local_pairs[j]
                         g = aft_grad(th_j, dX, dlogTt, r2, r, di, dj, n_val)
                         
-                    th_j = th_j - lr * g
+                    # 3. 纯净的次梯度下降
+                    th_j = th_j - lr_t * g
                     
-                    if lam > 0:
-                        th_j = soft_threshold(th_j, lr * lam)
+                    # 4. 近端算子
+                    if lam_cand > 0:
+                        th_j = soft_threshold(th_j, lr_t * lam_cand)
                     
+                    # 5. 变量空间投影
                     if task == 'ranking':
                         th_j = _proj_sphere(th_j)
                         
                     theta_new.append(th_j)
+                    # 记录最大参数更新量
+                    max_diff = max(max_diff, float(np.linalg.norm(th_j - theta[j])))
+                    
                 theta = theta_new
-                if return_history and theta_true is not None:
-                    hist_tmp['rmse'].append(float(np.mean([np.linalg.norm(th_iter - theta_true) for th_iter in theta])))
+                
+                # 核心改造 3：达成共识且微小更新时，提早终止当前 lambda 的通信迭代
+                if max_diff < tol:
+                    break
+            
+            # 用当前收敛参数更新热启动池
+            current_theta_init = [th.copy() for th in theta]
                 
             ic_val = compute_ic(theta, data, ic_type=ic_type)
             if ic_val < best_ic:
                 best_ic = ic_val
-                best_theta = theta
-                if return_history:
-                    best_history = hist_tmp
-                
-        if return_history:
-            return np.mean(best_theta, axis=0), best_history
-        return np.mean(best_theta, axis=0)
+                best_lam = lam_cand
     else:
+        best_lam = 0.0
         from utils.math_utils import soft_threshold
-        theta = [th.copy() for th in init_theta]
-        hist_tmp = {'rmse': []}
-        if return_history and theta_true is not None:
-            hist_tmp['rmse'].append(float(np.mean([np.linalg.norm(th_iter - theta_true) for th_iter in theta])))
-        for t in range(T):
-            theta_new = []
-            for j in range(m):
-                # 1. Consensus step (网络通信)
-                th_j = np.zeros((p, 1))
-                for k in range(m):
-                    if W[j, k] > 0:
-                        th_j += W[j, k] * theta[k]
-                
-                # 2. Local Gradient step
-                if task == 'ranking':
-                    dX, S = local_pairs[j]
-                    g = rank_grad(th_j, dX, S)
-                else:
-                    dX, dlogTt, r2, r, di, dj, n_val = local_pairs[j]
-                    g = aft_grad(th_j, dX, dlogTt, r2, r, di, dj, n_val)
-                    
-                th_j = th_j - lr * g
-                
-                if task == 'ranking':
-                    th_j = _proj_sphere(th_j)
-                    
-                theta_new.append(th_j)
-            theta = theta_new
-            if return_history and theta_true is not None:
-                hist_tmp['rmse'].append(float(np.mean([np.linalg.norm(th_iter - theta_true) for th_iter in theta])))
+
+    # --- 阶段二：画图阶段 (使用最优 lambda 严格跑满 T 轮，控制变量) ---
+    theta = [th.copy() for th in init_theta]  # 必须回到原点
+    hist_final = {'rmse': []}
+    
+    if return_history and theta_true is not None:
+        rmse = float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)]))
+        hist_final['rmse'].append(rmse)
+        
+    for t in range(1, T + 1):
+        lr_t = lr / np.sqrt(t)
+        theta_new = []
+        for j in range(m):
+            th_j = np.zeros((p, 1))
+            for k in range(m):
+                if W[j, k] > 0:
+                    th_j += W[j, k] * theta[k]
             
-        if return_history:
-            return np.mean(theta, axis=0), hist_tmp
-        return np.mean(theta, axis=0)
+            if task == 'ranking':
+                dX, S = local_pairs[j]
+                g = rank_grad(th_j, dX, S)
+            else:
+                dX, dlogTt, r2, r, di, dj, n_val = local_pairs[j]
+                g = aft_grad(th_j, dX, dlogTt, r2, r, di, dj, n_val)
+                
+            th_j = th_j - lr_t * g
+            
+            if best_lam > 0:
+                th_j = soft_threshold(th_j, lr_t * best_lam)
+                
+            if task == 'ranking':
+                th_j = _proj_sphere(th_j)
+                
+            theta_new.append(th_j)
+        theta = theta_new
+        
+        if return_history and theta_true is not None:
+            rmse = float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)]))
+            hist_final['rmse'].append(rmse)
+            
+    if return_history:
+        return np.mean(theta, axis=0), hist_final
+    return np.mean(theta, axis=0)

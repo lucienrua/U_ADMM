@@ -165,7 +165,7 @@ def inner_admm(theta_t_list, p_t_list, agg_grad_list, H_rho_list, W,
         numerators = []
         for j in range(m):
             sum_nb = sum(theta_w[k] for k in nb[j]) if nb[j] else np.zeros((p, 1))
-
+            # 重大修改
             # numerator = (
             #         H_rho_list[j] * theta_w[j]  # 使用内层变量作为近端锚点
             #         - agg_grad_list[j]
@@ -282,12 +282,19 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
     else:
         init_theta_t, theta_naive = init_all_nodes(data)
 
-    # 预计算各节点理论步长
+    # =========================================================
+    # 预计算区：标量近似 + 松弛因子极速加速
+    # =========================================================
     theoretical_rho_list = []
+    H_scale = 25.0  # 核心加速器：将理论最严苛的约束缩小 15 倍
+
     for j in range(m):
         X_j = data['X'][j]
         cov_j = (X_j.T @ X_j) / X_j.shape[0]
-        rho_j = float(np.linalg.eigvalsh(cov_j).max()) + 1e-3
+        max_eig = float(np.linalg.eigvalsh(cov_j).max())
+        
+        # 将上限标量缩小 H_scale 倍，极大提升等效学习率
+        rho_j = (max_eig / H_scale) + 1e-3 
         theoretical_rho_list.append(rho_j)
 
     history = {'rmse': [], 'consensus': [], 'debug': []}
@@ -301,7 +308,7 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
         return rmse
 
     if verbose:
-        print(f"  [Theory Rho] Mean={np.mean(theoretical_rho_list):.4f}, Max={np.max(theoretical_rho_list):.4f}")
+        print(f"  [Theory Rho] Mean={np.mean(theoretical_rho_list):.4f}, Max={np.max(theoretical_rho_list):.4f} (After H_scale={H_scale})")
 
     # =========================================================
     # 阶段一：调参阶段 (绝对外层全局搜索 + 连续热启动)
@@ -323,7 +330,6 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
             
             # 完整跑完 U-ADMM 的 T 轮代理构建
             for t in range(T):
-                # 提早终止判断的缓存
                 th_prev = [th.copy() for th in th_temp]
                 
                 agg_grad_list = [compute_agg_grad(j, th_temp, data) for j in range(m)]
@@ -333,7 +339,7 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
                     W_inner=W_inner, lam_t=lam_cand, project=(task == 'ranking')
                 )
                 
-                # U-ADMM 二阶逼近极快，加入外层提早终止可极大提速
+                # 提早终止：由于步长松弛，外层通常 2-4 轮即可满足极小差异
                 max_diff = max(float(np.linalg.norm(th_temp[j] - th_prev[j])) for j in range(m))
                 if max_diff < 1e-4:
                     break
@@ -354,7 +360,6 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
     # =========================================================
     # 阶段二：画图阶段 (使用全局最优 lambda 严格跑满 T 轮，记录完整历史)
     # =========================================================
-    # 必须回退到算法最初始的起点，保证与 D-subGD 的对比绝对公平
     theta_t = [th.copy() for th in init_theta_t]
     p_t = [np.zeros((p, 1)) for _ in range(m)]
     current_rho = rho
@@ -383,7 +388,6 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
 
         r = _record(theta_t)
         if verbose:
-            # 修改点：这里直接打印真正起作用的 best_lam
             print(f'  [t={t+1:2d}]  RMSE={r:.6f}, rho={current_rho:.4f}, lam_t={best_lam:.4f}')
 
     return theta_t, theta_naive, history

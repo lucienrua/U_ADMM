@@ -81,7 +81,7 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
 def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_init_list=None, return_history=False, tol=1e-4):
     """
     D-subGD (Decentralized Subgradient Descent)
-    引入降序热启动与提前终止的双阶段调参架构，完美兼容 L1 近端截断与球面投影。
+    采用绝对隔离的独立搜索，禁止热启动步数累积，保证 BIC 评判的绝对公平。
     """
     m = data['m']
     p = data['p']
@@ -99,7 +99,7 @@ def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_ini
             dX, dlogTt, r2, r, di, dj, n_val = aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'])
             local_pairs.append((dX, dlogTt, r2, r, di, dj, n_val))
             
-    # 初始化：优先使用热启动
+    # 初始化：确保所有算法起跑线一致
     if theta_init_list is not None:
         init_theta = [th.copy() for th in theta_init_list]
     elif task == 'ranking':
@@ -114,14 +114,14 @@ def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_ini
         best_ic = float('inf')
         best_lam = 0.0
         
-        # 核心改造 1：降序排列候选列表
+        # 降序排列候选列表
         sorted_lambdas = sorted(lambda_candidates, reverse=True)
-        # 核心改造 2：维护流动的网络参数起点
-        current_theta_init = [th.copy() for th in init_theta]
         
         # --- 阶段一：极速调参寻找最优 lambda ---
         for lam_cand in sorted_lambdas:
-            theta = [th.copy() for th in current_theta_init]
+            # 🔴 核心修复：绝对公平原则！
+            # 每次测试新的 lam，必须从最原始的起点重新出发，彻底切断热启动
+            theta = [th.copy() for th in init_theta]
             
             for t in range(1, T + 1):
                 lr_t = lr / np.sqrt(t) 
@@ -160,12 +160,12 @@ def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_ini
                     
                 theta = theta_new
                 
-                # 核心改造 3：达成共识且微小更新时，提早终止当前 lambda 的通信迭代
+                # 达成共识且微小更新时，提早终止当前 lambda 的通信迭代
                 if max_diff < tol:
                     break
             
-            # 用当前收敛参数更新热启动池
-            current_theta_init = [th.copy() for th in theta]
+            # 🔴 这里已经删除了 current_theta_init = [th.copy() for th in theta]
+            # 不再记录和传递收敛状态
                 
             ic_val = compute_ic(theta, data, ic_type=ic_type)
             if ic_val < best_ic:

@@ -1,3 +1,11 @@
+import os
+# 🟢 终极并行加速：必须在 import numpy 之前锁死底层多线程！
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 import time
 import numpy as np
 from models.ranking import generate_ranking_data
@@ -47,7 +55,7 @@ def run_single_ranking(seed, params):
     np.random.seed(seed)
     d_rank = generate_ranking_data(
         m=params['m'], n=params['n'], p_prime=params['p_prime'], 
-        p=params['p'], pc=params['pc'], noise_type=params['noise_type'], rng_seed=seed
+        p=params['p'], pc=params['pc'], noise_type=params['noise_type'], rng_seed=seed,noise_scale=params.get('noise_scale', 1.0)
     )
     
     theta_true = d_rank['theta_true']
@@ -120,7 +128,7 @@ def run_single_aft(seed, params):
     np.random.seed(seed)
     d_aft = generate_aft_data(
         m=params['m'], n=params['n'], p_prime=params.get('p_prime', 5), p=params['p'], 
-        pc=params['pc'], noise_type=params['noise_type'], rng_seed=seed
+        pc=params['pc'], noise_type=params['noise_type'], rng_seed=seed,noise_scale=params.get('noise_scale', 1.0)
     )
     
     theta_true = d_aft['theta_true']

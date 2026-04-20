@@ -4,10 +4,84 @@ from models.ranking import rank_grad, rank_loss, ranking_pairs
 from models.aft import aft_grad, aft_loss, aft_pairs
 from algorithms.admm import local_gd
 
+# def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False, tol=1e-5):
+#     """
+#     Pooled MR (Global U-ERM): 将所有本地数据汇总到一台机器上。
+#     引入正则化路径 (降序排列) + 连续热启动 + 双阶段解耦。
+#     """
+#     task = data['task']
+#     p = data['p']
+#     theta_true = data.get('theta_true', None) if return_history else None
+    
+#     if task == 'ranking':
+#         X_all = np.vstack(data['X'])
+#         Y_all = np.concatenate(data['Y'])
+#         dX, S = ranking_pairs(X_all, Y_all)
+        
+#         gfn = lambda th: rank_grad(th, dX, S)
+#         lfn = lambda th: rank_loss(th, dX, S)
+#         init = init_theta.copy() if init_theta is not None else np.ones((p, 1)) / np.sqrt(p)
+#         project = True
+        
+#     elif task == 'aft':
+#         X_all = np.vstack(data['X'])
+#         logTt_all = np.concatenate(data['logTt'])
+#         delta_all = np.concatenate(data['delta'])
+#         Sigma = data['Sigma']
+        
+#         dX, dlogTt, r2, r, di, dj, n_val = aft_pairs(X_all, logTt_all, delta_all, Sigma)
+        
+#         gfn = lambda th: aft_grad(th, dX, dlogTt, r2, r, di, dj, n_val)
+#         lfn = lambda th: aft_loss(th, dX, dlogTt, r2, r, di, dj, n_val)
+#         init = init_theta.copy() if init_theta is not None else np.zeros((p, 1))
+#         project = False
+        
+#     if lambda_candidates is not None and len(lambda_candidates) > 0:
+#         best_ic = float('inf')
+#         best_lam = 0.0
+#         N_total = sum(data['X'][j].shape[0] for j in range(data['m']))
+        
+#         # 核心改造 1：强制降序排列 lambda_candidates
+#         sorted_lambdas = sorted(lambda_candidates, reverse=True)
+#         # 核心改造 2：建立流动的热启动起点
+#         current_init_theta = init.copy()
+        
+#         # --- 阶段一：极速调参寻找最优 lambda ---
+#         for lam in sorted_lambdas:
+#             # 开启提前终止 (如果 local_gd 支持 tol) 进行极速收敛，不记录 history
+#             theta_tmp = local_gd(gfn, lfn, current_init_theta, n_iter=n_iter, lr_init=lr, project=project, lam=lam)
+            
+#             # 核心改造 3：用当前收敛的参数更新流动起点，喂给下一个更小的 lam
+#             current_init_theta = theta_tmp.copy()
+            
+#             loss_val = lfn(theta_tmp)
+#             df = np.sum(np.abs(theta_tmp) > 1e-4)
+#             avg_loss = loss_val if loss_val > 0 else 1e-10
+            
+#             if ic_type.lower() == 'aic':
+#                 ic_val = np.log(avg_loss) + (2.0 / N_total) * df
+#             else:
+#                 ic_val = np.log(avg_loss) + (np.log(N_total) / N_total) * df
+            
+#             if ic_val < best_ic:
+#                 best_ic = ic_val
+#                 best_lam = lam
+#     else:
+#         best_lam = 0.0
+
+#     # --- 阶段二：画图阶段 (使用全局最优 lambda 严格跑满 n_iter 轮) ---
+#     if return_history:
+#         # 回退到原始起点 init，严格跑满并记录 history
+#         best_theta, best_history = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=best_lam, theta_true=theta_true)
+#         return best_theta, best_history
+#     else:
+#         best_theta = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=best_lam)
+#         return best_theta
+# #以上的方法是继承制lam，以下的算法是并行lam
 def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False, tol=1e-5):
     """
     Pooled MR (Global U-ERM): 将所有本地数据汇总到一台机器上。
-    引入正则化路径 (降序排列) + 连续热启动 + 双阶段解耦。
+    取消热启动，每个 lambda 独立从头开始，保证绝对公平的评估。
     """
     task = data['task']
     p = data['p']
@@ -41,18 +115,12 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
         best_lam = 0.0
         N_total = sum(data['X'][j].shape[0] for j in range(data['m']))
         
-        # 核心改造 1：强制降序排列 lambda_candidates
         sorted_lambdas = sorted(lambda_candidates, reverse=True)
-        # 核心改造 2：建立流动的热启动起点
-        current_init_theta = init.copy()
         
         # --- 阶段一：极速调参寻找最优 lambda ---
         for lam in sorted_lambdas:
-            # 开启提前终止 (如果 local_gd 支持 tol) 进行极速收敛，不记录 history
-            theta_tmp = local_gd(gfn, lfn, current_init_theta, n_iter=n_iter, lr_init=lr, project=project, lam=lam)
-            
-            # 核心改造 3：用当前收敛的参数更新流动起点，喂给下一个更小的 lam
-            current_init_theta = theta_tmp.copy()
+            # 🔴 核心修复：绝对公平原则！取消热启动，每次测试新的 lam 都从最原始的 init.copy() 重新出发
+            theta_tmp = local_gd(gfn, lfn, init.copy(), n_iter=n_iter, lr_init=lr, project=project, lam=lam)
             
             loss_val = lfn(theta_tmp)
             df = np.sum(np.abs(theta_tmp) > 1e-4)
@@ -72,10 +140,10 @@ def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='
     # --- 阶段二：画图阶段 (使用全局最优 lambda 严格跑满 n_iter 轮) ---
     if return_history:
         # 回退到原始起点 init，严格跑满并记录 history
-        best_theta, best_history = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=best_lam, theta_true=theta_true)
+        best_theta, best_history = local_gd(gfn, lfn, init.copy(), n_iter=n_iter, lr_init=lr, project=project, lam=best_lam, theta_true=theta_true)
         return best_theta, best_history
     else:
-        best_theta = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=best_lam)
+        best_theta = local_gd(gfn, lfn, init.copy(), n_iter=n_iter, lr_init=lr, project=project, lam=best_lam)
         return best_theta
 
 def run_dgd(data, T=50, lr=0.1, lambda_candidates=None, ic_type='bic', theta_init_list=None, return_history=False, tol=1e-4):

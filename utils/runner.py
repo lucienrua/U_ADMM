@@ -11,7 +11,7 @@ import numpy as np
 from models.ranking import generate_ranking_data
 from models.aft import generate_aft_data
 from algorithms.admm import run_u_admm, init_all_nodes
-from algorithms.baselines import run_global_u_erm, run_dgd
+from algorithms.baselines import run_global_u_erm, run_dgd, run_dpgd
 from utils.eval_utils import evaluate_ranking_accuracy, calculate_metrics, evaluate_correlation
 
 def get_metrics_ranking(theta, theta_true, X, Y, quantiles, t_cost):
@@ -121,7 +121,18 @@ def run_single_ranking(seed, params):
         result['D-subGD'] = get_metrics_ranking(theta_dgd, theta_true, X, Y, quantiles, t_dgd)
         result['D-subGD']['hist_rmse'] = hist_dgd['rmse']
         result['D-subGD']['theta_hat'] = theta_dgd.flatten().tolist()
-        
+
+    if params.get('run_dpgd', False):
+        t0 = time.time()
+        dpgd_lr = params.get('dpgd_lr', 0.1)
+        dpgd_lambdas = params.get('lambda_dpgd', lambda_candidates)
+        # 传递 theta0_list 作为 DPGD 的初始分布
+        theta_dpgd, hist_dpgd = run_dpgd(d_rank, T=params['T'] * params['W_inner'], lr=dpgd_lr, lambda_candidates=dpgd_lambdas, ic_type=ic_type, theta_init_list=theta0_list, return_history=True)
+        t_dpgd = time.time() - t0
+        result['DPGD'] = get_metrics_ranking(theta_dpgd, theta_true, X, Y, quantiles, t_dpgd)
+        result['DPGD']['hist_rmse'] = hist_dpgd['rmse']
+        result['DPGD']['theta_hat'] = theta_dpgd.flatten().tolist()
+
     return result
 
 def run_single_aft(seed, params):
@@ -187,5 +198,15 @@ def run_single_aft(seed, params):
         result['D-subGD'] = get_metrics_aft(theta_dgd, theta_true, d_aft['X'], t_dgd)
         result['D-subGD']['hist_rmse'] = hist_dgd['rmse']
         result['D-subGD']['theta_hat'] = theta_dgd.flatten().tolist()
-        
+
+    if params.get('run_dpgd', False):
+        t0 = time.time()
+        dpgd_lr = params.get('dpgd_lr', 0.1)
+        dpgd_lambdas = params.get('lambda_dpgd', lambda_candidates)
+        theta_dpgd, hist_dpgd = run_dpgd(d_aft, T=params['T'] * params['W_inner'], lr=dpgd_lr, lambda_candidates=dpgd_lambdas, ic_type=ic_type, theta_init_list=theta0_list, return_history=True)
+        t_dpgd = time.time() - t0
+        result['DPGD'] = get_metrics_aft(theta_dpgd, theta_true, d_aft['X'], t_dpgd)
+        result['DPGD']['hist_rmse'] = hist_dpgd['rmse']
+        result['DPGD']['theta_hat'] = theta_dpgd.flatten().tolist()
+
     return result

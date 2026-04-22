@@ -419,22 +419,122 @@ def run_dgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_in
 #         return np.mean(theta, axis=0), hist_final
 #     return np.mean(theta, axis=0)
 
-def run_dpgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_init_list=None, return_history=False):
+def run_dpgd(data, T=500, lr=0.02,
+             lambda_candidates=None, ic_type='bic', theta_init_list=None, return_history=False):
     """
     DPGD (Decentralized Proximal Gradient Descent) — 分布式近端梯度下降
-    适用于平滑损失函数（成对逻辑损失 / 高斯平滑秩损失）+ l1 正则化。
 
-    迭代逻辑（每轮 t，每个节点 j）：
-      Step 1: 共识  v_j = sum_k W[j,k] * theta_k
-      Step 2: 梯度  u_j = v_j - lr_t * grad_L_j(v_j)
-      Step 3: 近端  theta_j = soft_threshold(u_j, lr_t * lambda)
-      Step 4: 投影  (ranking 任务) theta_j = proj_sphere(theta_j)
-               去噪  theta_j[|theta_j| < 1e-5] = 0   ← 保证 BIC df 准确
+    每轮迭代（节点 j）：
+      Step 1: Consensus   v_j = Σ_k W[j,k] * theta_k
+      Step 2: Gradient    u_j = v_j - lr * grad_L_j(v_j)
+      Step 3: Proximal    theta_j = soft_threshold(u_j, lr * lambda)
+      Step 4: Project     (ranking) theta_j = proj_sphere(theta_j)；物理去噪
 
-    设计原则：
-      - 绝对冷启动：每个 lambda 候选独立从 init_theta 出发，禁止热启动
-      - 步长策略：前 80% 恒定步长 lr，后 20% 线性衰减至 0.5*lr（柔性截断）
-      - 强制跑满 T 轮，不设 max_diff < tol 的提前终止
+    步长策略：恒定步长 lr（默认 0.02）。
+      - Adam / 1/t 在 ranking 热启动（SLSQP）下步长爆炸或收敛过慢
+      - lr=0.02 的恒定步长在球面约束下足够小，1000步内不发散
+      - 若收敛不足，可适当增大 lr；若后期振荡，可适当减小 lr
+    """
+    m    = data['m']
+    p    = data['p']
+    W    = data['W']
+    task = data['task']
+    theta_true = data.get('theta_true', None) if return_history else None
+
+    # ── 预计算本地 pairs ──────────────────────────────────────────────
+    local_pairs = []
+    for j in range(m):
+        if task == 'ranking':
+            from models.ranking import ranking_pairs, rank_grad
+            dX, S = ranking_pairs(data['X'][j], data['Y'][j])
+            local_pairs.append((dX, S))
+        elif task == 'aft':
+            from models.aft import aft_pairs, aft_grad
+            dX, dlogTt, r2, r, di, dj_idx, n_val = aft_pairs(
+                data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'])
+            local_pairs.append((dX, dlogTt, r2, r, di, dj_idx, n_val))
+
+    # ── 初始化起点 ────────────────────────────────────────────────────
+    if theta_init_list is not None:
+        init_theta = [th.copy() for th in theta_init_list]
+    elif task == 'ranking':
+        init_theta = [np.ones((p, 1)) / np.sqrt(p) for _ in range(m)]
+    else:
+        init_theta = [np.zeros((p, 1)) for _ in range(m)]
+
+    # ── 单轮迭代（恒定步长） ─────────────────────────────────────────
+    def _step(theta, lam):
+        theta_new = []
+        for j in range(m):
+            # Step 1: 共识
+            v_j = np.zeros((p, 1))
+            for k in range(m):
+                if W[j, k] > 0:
+                    v_j += W[j, k] * theta[k]
+            # Step 2: 梯度下降
+            if task == 'ranking':
+                dX, S = local_pairs[j]
+                g = rank_grad(v_j, dX, S)
+            else:
+                dX, dlogTt, r2, r, di, dj_idx, n_val = local_pairs[j]
+                g = aft_grad(v_j, dX, dlogTt, r2, r, di, dj_idx, n_val)
+            v_j = v_j - lr * g
+            # Step 3: 软阈值
+            if lam > 0:
+                v_j = soft_threshold(v_j, lr * lam)
+            # Step 4: 投影 + 去噪（ranking 专属）
+            if task == 'ranking':
+                v_j = _proj_sphere(v_j)
+                v_j[np.abs(v_j) < 1e-5] = 0.0
+            theta_new.append(v_j)
+        return theta_new
+
+    # ── 阶段一：冷启动调参 ────────────────────────────────────────────
+    if lambda_candidates is not None and len(lambda_candidates) > 0:
+        best_ic, best_lam = float('inf'), 0.0
+        for lam_cand in sorted(lambda_candidates, reverse=True):
+            theta = [th.copy() for th in init_theta]
+            for _ in range(T):
+                theta = _step(theta, lam_cand)
+            ic_val = compute_ic(theta, data, ic_type=ic_type)
+            if ic_val < best_ic:
+                best_ic, best_lam = ic_val, lam_cand
+    else:
+        best_lam = 0.0
+
+    # ── 阶段二：最优 lambda 跑满 T 轮，记录历史 ──────────────────────
+    theta = [th.copy() for th in init_theta]
+    hist_final = {'rmse': []}
+
+    if return_history and theta_true is not None:
+        hist_final['rmse'].append(
+            float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)])))
+
+    for _ in range(T):
+        theta = _step(theta, best_lam)
+        if return_history and theta_true is not None:
+            hist_final['rmse'].append(
+                float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)])))
+
+    if return_history:
+        return np.mean(theta, axis=0), hist_final
+    return np.mean(theta, axis=0)
+
+    """
+    DPGD + Adam (Decentralized Proximal Gradient Descent with Adam)
+
+    每轮迭代（节点 j）：
+      Step 1: Consensus   v_j = sum_k W[j,k] * theta_k
+      Step 2: Gradient    g_j = grad_L_j(v_j)
+      Step 3: Adam update m_j = beta1*m_j + (1-beta1)*g_j
+                          v2_j = beta2*v2_j + (1-beta2)*g_j^2
+                          lr_t = lr * sqrt(1-beta2^t) / (1-beta1^t)
+                          theta_j = v_j - lr_t * m_hat / (sqrt(v2_hat) + eps)
+      Step 4: Proximal    theta_j = soft_threshold(theta_j, lr_t * lambda)
+      Step 5: Project     (ranking) theta_j = proj_sphere(theta_j)；去噪
+
+    Adam 的二阶矩会自动将后期步长压至极小，解决球面约束下的后期发散问题，
+    同时前期动量加速使收敛速度快于手动调度的单调衰减策略。
     """
     m    = data['m']
     p    = data['p']
@@ -463,60 +563,68 @@ def run_dpgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_i
     else:
         init_theta = [np.zeros((p, 1)) for _ in range(m)]
 
-    # ── 内部辅助：单轮迭代 ───────────────────────────────────────────
-    def _single_iter(theta, lam, lr_t):
-        theta_new = []
+    # ── 内部辅助：Adam 单轮迭代 ──────────────────────────────────────
+    def _adam_iter(theta, m1, m2, t_step, lam):
+        """
+        m1: 各节点一阶矩列表, m2: 各节点二阶矩列表
+        t_step: 全局步数（用于偏差校正）
+        """
+        theta_new, m1_new, m2_new = [], [], []
         for j in range(m):
-            # Step 1: 共识
-            th_j = np.zeros((p, 1))
+            # Step 1: 共识（加权平均邻居参数）
+            v_j = np.zeros((p, 1))
             for k in range(m):
                 if W[j, k] > 0:
-                    th_j += W[j, k] * theta[k]
+                    v_j += W[j, k] * theta[k]
 
-            # Step 2: 本地平滑梯度下降
+            # Step 2: 计算本地梯度
             if task == 'ranking':
                 dX, S = local_pairs[j]
-                g = rank_grad(th_j, dX, S)
+                g_j = rank_grad(v_j, dX, S)
             else:
                 dX, dlogTt, r2, r, di, dj_idx, n_val = local_pairs[j]
-                g = aft_grad(th_j, dX, dlogTt, r2, r, di, dj_idx, n_val)
-            th_j = th_j - lr_t * g
+                g_j = aft_grad(v_j, dX, dlogTt, r2, r, di, dj_idx, n_val)
 
-            # Step 3: 软阈值近端映射（精确稀疏）
+            # Step 3: Adam 矩更新 + 偏差校正
+            m1_j = beta1 * m1[j] + (1.0 - beta1) * g_j
+            m2_j = beta2 * m2[j] + (1.0 - beta2) * (g_j ** 2)
+            m1_hat = m1_j / (1.0 - beta1 ** t_step)
+            m2_hat = m2_j / (1.0 - beta2 ** t_step)
+            lr_t   = lr / (np.sqrt(m2_hat) + eps)   # 每维度自适应步长
+
+            # Step 4: 参数更新（Adam 步）
+            th_j = v_j - lr_t * m1_hat
+
+            # Step 5: 软阈值近端映射（稀疏化）
+            # 近端步长用 lr（标量），保持与 lambda 量纲一致
             if lam > 0:
-                th_j = soft_threshold(th_j, lr_t * lam)
+                th_j = soft_threshold(th_j, lr * lam)
 
-            # Step 4: 投影 + 物理去噪（ranking 任务专属，极度关键）
+            # Step 6: 投影 + 物理去噪（ranking 专属）
             if task == 'ranking':
                 th_j = _proj_sphere(th_j)
-                th_j[np.abs(th_j) < 1e-5] = 0.0  # 消除除法底噪，保证 BIC df 准确
+                th_j[np.abs(th_j) < 1e-5] = 0.0
 
             theta_new.append(th_j)
-        return theta_new
+            m1_new.append(m1_j)
+            m2_new.append(m2_j)
 
-    # ── 步长调度：前 80% 恒定，后 20% 线性衰减至 0.5*lr ─────────────
-    warmup_end = int(0.8 * T)
+        return theta_new, m1_new, m2_new
 
-    def _get_lr(t):
-        if t <= warmup_end:
-            return lr
-        decay = 1.0 - 0.5 * (t - warmup_end) / max(T - warmup_end, 1)
-        return lr * decay
-
-    # ── 阶段一：调参（冷启动，绝对隔离） ────────────────────────────
+    # ── 阶段一：调参（冷启动，每个 lambda 独立从 init_theta 出发） ────
     if lambda_candidates is not None and len(lambda_candidates) > 0:
         best_ic  = float('inf')
         best_lam = 0.0
         sorted_lambdas = sorted(lambda_candidates, reverse=True)
 
         for lam_cand in sorted_lambdas:
-            # 🔴 绝对冷启动：每个 lam 独立从原始 init_theta 出发
+            # 冷启动：一阶矩和二阶矩也从零开始
             theta = [th.copy() for th in init_theta]
+            m1    = [np.zeros((p, 1)) for _ in range(m)]
+            m2    = [np.zeros((p, 1)) for _ in range(m)]
 
             for t in range(1, T + 1):
-                lr_t  = _get_lr(t)
-                theta = _single_iter(theta, lam_cand, lr_t)
-                # 🔴 强制跑满 T 轮，无提前终止
+                theta, m1, m2 = _adam_iter(theta, m1, m2, t, lam_cand)
 
             ic_val = compute_ic(theta, data, ic_type=ic_type)
             if ic_val < best_ic:
@@ -525,8 +633,10 @@ def run_dpgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_i
     else:
         best_lam = 0.0
 
-    # ── 阶段二：使用最优 lambda 严格跑满 T 轮，记录历史 ──────────────
-    theta    = [th.copy() for th in init_theta]
+    # ── 阶段二：最优 lambda 跑满 T 轮，记录历史 ──────────────────────
+    theta = [th.copy() for th in init_theta]
+    m1    = [np.zeros((p, 1)) for _ in range(m)]
+    m2    = [np.zeros((p, 1)) for _ in range(m)]
     hist_final = {'rmse': []}
 
     if return_history and theta_true is not None:
@@ -534,8 +644,7 @@ def run_dpgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_i
         hist_final['rmse'].append(rmse_0)
 
     for t in range(1, T + 1):
-        lr_t  = _get_lr(t)
-        theta = _single_iter(theta, best_lam, lr_t)
+        theta, m1, m2 = _adam_iter(theta, m1, m2, t, best_lam)
 
         if return_history and theta_true is not None:
             rmse = float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)]))
@@ -544,3 +653,4 @@ def run_dpgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_i
     if return_history:
         return np.mean(theta, axis=0), hist_final
     return np.mean(theta, axis=0)
+

@@ -6,7 +6,7 @@ from algorithms.admm import local_gd, compute_ic
 
 # def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False, tol=1e-5):
 #     """
-#     Pooled MR (Global U-ERM): 将所有本地数据汇总到一台机器上。
+#     Pool (Global U-ERM): 将所有本地数据汇总到一台机器上。
 #     引入正则化路径 (降序排列) + 连续热启动 + 双阶段解耦。
 #     """
 #     task = data['task']
@@ -80,7 +80,7 @@ from algorithms.admm import local_gd, compute_ic
 # #以上的方法是继承制lam，以下的算法是并行lam
 def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False, tol=1e-5):
     """
-    Pooled MR (Global U-ERM): 将所有本地数据汇总到一台机器上。
+    Pool (Global U-ERM): 将所有本地数据汇总到一台机器上。
     取消热启动，每个 lambda 独立从头开始，保证绝对公平的评估。
     """
     task = data['task']
@@ -419,25 +419,15 @@ def run_dgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_in
 #         return np.mean(theta, axis=0), hist_final
 #     return np.mean(theta, axis=0)
 
-def run_dpgd(data, T=500, lr=0.02,
-             lambda_candidates=None, ic_type='bic', theta_init_list=None, return_history=False):
+def run_d_proxgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', 
+             theta_init_list=None, return_history=False, decay_interval=100, decay_rate=0.5):
     """
-    DPGD (Decentralized Proximal Gradient Descent) — 分布式近端梯度下降
-
-    每轮迭代（节点 j）：
-      Step 1: Consensus   v_j = Σ_k W[j,k] * theta_k
-      Step 2: Gradient    u_j = v_j - lr * grad_L_j(v_j)
-      Step 3: Proximal    theta_j = soft_threshold(u_j, lr * lambda)
-      Step 4: Project     (ranking) theta_j = proj_sphere(theta_j)；物理去噪
-
-    步长策略：恒定步长 lr（默认 0.02）。
-      - Adam / 1/t 在 ranking 热启动（SLSQP）下步长爆炸或收敛过慢
-      - lr=0.02 的恒定步长在球面约束下足够小，1000步内不发散
-      - 若收敛不足，可适当增大 lr；若后期振荡，可适当减小 lr
+    D-ProxGD (Decentralized Proximal Gradient Descent)
+    【修复版】：恢复了阶梯衰减机制，保证前期强力去噪，后期高精度收敛。
     """
-    m    = data['m']
-    p    = data['p']
-    W    = data['W']
+    m = data['m']
+    p = data['p']
+    W = data['W']
     task = data['task']
     theta_true = data.get('theta_true', None) if return_history else None
 
@@ -462,27 +452,27 @@ def run_dpgd(data, T=500, lr=0.02,
     else:
         init_theta = [np.zeros((p, 1)) for _ in range(m)]
 
-    # ── 单轮迭代（恒定步长） ─────────────────────────────────────────
-    def _step(theta, lam):
+    # ── 单轮迭代（带动态步长） ─────────────────────────────────────────
+    def _step(theta, lam, current_lr):
         theta_new = []
         for j in range(m):
-            # Step 1: 共识
             v_j = np.zeros((p, 1))
             for k in range(m):
                 if W[j, k] > 0:
                     v_j += W[j, k] * theta[k]
-            # Step 2: 梯度下降
+                    
             if task == 'ranking':
                 dX, S = local_pairs[j]
                 g = rank_grad(v_j, dX, S)
             else:
                 dX, dlogTt, r2, r, di, dj_idx, n_val = local_pairs[j]
                 g = aft_grad(v_j, dX, dlogTt, r2, r, di, dj_idx, n_val)
-            v_j = v_j - lr * g
-            # Step 3: 软阈值
+                
+            v_j = v_j - current_lr * g
+            
             if lam > 0:
-                v_j = soft_threshold(v_j, lr * lam)
-            # Step 4: 投影 + 去噪（ranking 专属）
+                v_j = soft_threshold(v_j, current_lr * lam)
+                
             if task == 'ranking':
                 v_j = _proj_sphere(v_j)
                 v_j[np.abs(v_j) < 1e-5] = 0.0
@@ -494,8 +484,11 @@ def run_dpgd(data, T=500, lr=0.02,
         best_ic, best_lam = float('inf'), 0.0
         for lam_cand in sorted(lambda_candidates, reverse=True):
             theta = [th.copy() for th in init_theta]
-            for _ in range(T):
-                theta = _step(theta, lam_cand)
+            for t in range(T):
+                # 阶梯衰减逻辑
+                current_lr = lr * (decay_rate ** (t // decay_interval))
+                theta = _step(theta, lam_cand, current_lr)
+                
             ic_val = compute_ic(theta, data, ic_type=ic_type)
             if ic_val < best_ic:
                 best_ic, best_lam = ic_val, lam_cand
@@ -510,8 +503,11 @@ def run_dpgd(data, T=500, lr=0.02,
         hist_final['rmse'].append(
             float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)])))
 
-    for _ in range(T):
-        theta = _step(theta, best_lam)
+    for t in range(T):
+        # 同样的阶梯衰减逻辑
+        current_lr = lr * (decay_rate ** (t // decay_interval))
+        theta = _step(theta, best_lam, current_lr)
+        
         if return_history and theta_true is not None:
             hist_final['rmse'].append(
                 float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)])))
@@ -519,138 +515,3 @@ def run_dpgd(data, T=500, lr=0.02,
     if return_history:
         return np.mean(theta, axis=0), hist_final
     return np.mean(theta, axis=0)
-
-    """
-    DPGD + Adam (Decentralized Proximal Gradient Descent with Adam)
-
-    每轮迭代（节点 j）：
-      Step 1: Consensus   v_j = sum_k W[j,k] * theta_k
-      Step 2: Gradient    g_j = grad_L_j(v_j)
-      Step 3: Adam update m_j = beta1*m_j + (1-beta1)*g_j
-                          v2_j = beta2*v2_j + (1-beta2)*g_j^2
-                          lr_t = lr * sqrt(1-beta2^t) / (1-beta1^t)
-                          theta_j = v_j - lr_t * m_hat / (sqrt(v2_hat) + eps)
-      Step 4: Proximal    theta_j = soft_threshold(theta_j, lr_t * lambda)
-      Step 5: Project     (ranking) theta_j = proj_sphere(theta_j)；去噪
-
-    Adam 的二阶矩会自动将后期步长压至极小，解决球面约束下的后期发散问题，
-    同时前期动量加速使收敛速度快于手动调度的单调衰减策略。
-    """
-    m    = data['m']
-    p    = data['p']
-    W    = data['W']
-    task = data['task']
-    theta_true = data.get('theta_true', None) if return_history else None
-
-    # ── 预计算本地 pairs ──────────────────────────────────────────────
-    local_pairs = []
-    for j in range(m):
-        if task == 'ranking':
-            from models.ranking import ranking_pairs, rank_grad
-            dX, S = ranking_pairs(data['X'][j], data['Y'][j])
-            local_pairs.append((dX, S))
-        elif task == 'aft':
-            from models.aft import aft_pairs, aft_grad
-            dX, dlogTt, r2, r, di, dj_idx, n_val = aft_pairs(
-                data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'])
-            local_pairs.append((dX, dlogTt, r2, r, di, dj_idx, n_val))
-
-    # ── 初始化起点（所有算法共享同一起点，公平比较） ──────────────────
-    if theta_init_list is not None:
-        init_theta = [th.copy() for th in theta_init_list]
-    elif task == 'ranking':
-        init_theta = [np.ones((p, 1)) / np.sqrt(p) for _ in range(m)]
-    else:
-        init_theta = [np.zeros((p, 1)) for _ in range(m)]
-
-    # ── 内部辅助：Adam 单轮迭代 ──────────────────────────────────────
-    def _adam_iter(theta, m1, m2, t_step, lam):
-        """
-        m1: 各节点一阶矩列表, m2: 各节点二阶矩列表
-        t_step: 全局步数（用于偏差校正）
-        """
-        theta_new, m1_new, m2_new = [], [], []
-        for j in range(m):
-            # Step 1: 共识（加权平均邻居参数）
-            v_j = np.zeros((p, 1))
-            for k in range(m):
-                if W[j, k] > 0:
-                    v_j += W[j, k] * theta[k]
-
-            # Step 2: 计算本地梯度
-            if task == 'ranking':
-                dX, S = local_pairs[j]
-                g_j = rank_grad(v_j, dX, S)
-            else:
-                dX, dlogTt, r2, r, di, dj_idx, n_val = local_pairs[j]
-                g_j = aft_grad(v_j, dX, dlogTt, r2, r, di, dj_idx, n_val)
-
-            # Step 3: Adam 矩更新 + 偏差校正
-            m1_j = beta1 * m1[j] + (1.0 - beta1) * g_j
-            m2_j = beta2 * m2[j] + (1.0 - beta2) * (g_j ** 2)
-            m1_hat = m1_j / (1.0 - beta1 ** t_step)
-            m2_hat = m2_j / (1.0 - beta2 ** t_step)
-            lr_t   = lr / (np.sqrt(m2_hat) + eps)   # 每维度自适应步长
-
-            # Step 4: 参数更新（Adam 步）
-            th_j = v_j - lr_t * m1_hat
-
-            # Step 5: 软阈值近端映射（稀疏化）
-            # 近端步长用 lr（标量），保持与 lambda 量纲一致
-            if lam > 0:
-                th_j = soft_threshold(th_j, lr * lam)
-
-            # Step 6: 投影 + 物理去噪（ranking 专属）
-            if task == 'ranking':
-                th_j = _proj_sphere(th_j)
-                th_j[np.abs(th_j) < 1e-5] = 0.0
-
-            theta_new.append(th_j)
-            m1_new.append(m1_j)
-            m2_new.append(m2_j)
-
-        return theta_new, m1_new, m2_new
-
-    # ── 阶段一：调参（冷启动，每个 lambda 独立从 init_theta 出发） ────
-    if lambda_candidates is not None and len(lambda_candidates) > 0:
-        best_ic  = float('inf')
-        best_lam = 0.0
-        sorted_lambdas = sorted(lambda_candidates, reverse=True)
-
-        for lam_cand in sorted_lambdas:
-            # 冷启动：一阶矩和二阶矩也从零开始
-            theta = [th.copy() for th in init_theta]
-            m1    = [np.zeros((p, 1)) for _ in range(m)]
-            m2    = [np.zeros((p, 1)) for _ in range(m)]
-
-            for t in range(1, T + 1):
-                theta, m1, m2 = _adam_iter(theta, m1, m2, t, lam_cand)
-
-            ic_val = compute_ic(theta, data, ic_type=ic_type)
-            if ic_val < best_ic:
-                best_ic  = ic_val
-                best_lam = lam_cand
-    else:
-        best_lam = 0.0
-
-    # ── 阶段二：最优 lambda 跑满 T 轮，记录历史 ──────────────────────
-    theta = [th.copy() for th in init_theta]
-    m1    = [np.zeros((p, 1)) for _ in range(m)]
-    m2    = [np.zeros((p, 1)) for _ in range(m)]
-    hist_final = {'rmse': []}
-
-    if return_history and theta_true is not None:
-        rmse_0 = float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)]))
-        hist_final['rmse'].append(rmse_0)
-
-    for t in range(1, T + 1):
-        theta, m1, m2 = _adam_iter(theta, m1, m2, t, best_lam)
-
-        if return_history and theta_true is not None:
-            rmse = float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)]))
-            hist_final['rmse'].append(rmse)
-
-    if return_history:
-        return np.mean(theta, axis=0), hist_final
-    return np.mean(theta, axis=0)
-

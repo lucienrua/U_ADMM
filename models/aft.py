@@ -100,12 +100,14 @@ def generate_aft_data(m, n, p, pc, cens_target=0.25, noise_type='gumbel', rng_se
                 noise_type=noise_type,
                 task='aft')
 
-def aft_pairs(X, logTt, delta, Sigma):
+def aft_pairs(X, logTt, delta, Sigma, base_n=None):
     n = X.shape[0]
+    if base_n is None:
+        base_n = n
     ii, jj = map(np.array, zip(*combinations(range(n), 2)))
     dX = X[ii] - X[jj]
     dlogTt = logTt[jj] - logTt[ii]
-    r2 = np.maximum(np.einsum('ij,jk,ik->i', dX, Sigma, dX) / n, 1e-8)
+    r2 = np.maximum(np.einsum('ij,jk,ik->i', dX, Sigma, dX) / base_n, 1e-8)
     r = np.sqrt(r2)
     di = delta[ii]
     dj = delta[jj]

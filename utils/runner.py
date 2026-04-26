@@ -17,18 +17,11 @@ from utils.eval_utils import evaluate_ranking_accuracy, calculate_metrics, evalu
 def get_metrics_ranking(theta, theta_true, X, Y, quantiles, t_cost):
     metrics = calculate_metrics(theta_true, theta)
     acc_dict = evaluate_ranking_accuracy(X, Y, theta, quantiles)
-    corr_dict = evaluate_correlation(X, theta_true, theta)
     
     return {
         'RMSE': metrics['RMSE'],
         'MAE': metrics['MAE'],
-        'Selection_Acc': metrics['Selection_Acc'],
-        'Precision': metrics['Precision'],
-        'Recall': metrics['Recall'],
-        'F1_Score': metrics['F1_Score'],
         'Pairwise_Correlation': float(acc_dict['Pairwise_Correlation']),
-        'Pearson_Corr': corr_dict['Pearson_Corr'],
-        'Kendall_Corr': corr_dict['Kendall_Corr'],
         'Total_Pairs': acc_dict['Total_Pairs'],
         'Correct_Pairs': acc_dict['Correct_Pairs'],
         'Time': float(t_cost)
@@ -41,13 +34,7 @@ def get_metrics_aft(theta, theta_true, X, t_cost):
     return {
         'RMSE': metrics['RMSE'],
         'MAE': metrics['MAE'],
-        'Selection_Acc': metrics['Selection_Acc'],
-        'Precision': metrics['Precision'],
-        'Recall': metrics['Recall'],
-        'F1_Score': metrics['F1_Score'],
         'Pairwise_Correlation': (corr_dict['Kendall_Corr'] + 1) / 2.0,
-        'Pearson_Corr': corr_dict['Pearson_Corr'],
-        'Kendall_Corr': corr_dict['Kendall_Corr'],
         'Time': float(t_cost)
     }
 
@@ -75,21 +62,15 @@ def run_single_ranking(seed, params):
     run_D_ProxGD = params.get('run_D_ProxGD', True)
 
     # 1. 默认必跑：Avg 和 Local
+    # Avg: 对应初始化的平均值 (theta_naive)
     result['Avg'] = get_metrics_ranking(theta_naive, theta_true, X, Y, quantiles, 0.0)
+    result['Avg']['theta_hat'] = theta_naive.flatten().tolist()
     
+    # Local: 对应第一个节点的系数估计 (theta0_list[0])
     t0 = time.time()
-    local_rmses, local_maes, local_accs = [], [], []
-    for th in theta0_list:
-        m_dict = get_metrics_ranking(th, theta_true, X, Y, quantiles, 0)
-        local_rmses.append(m_dict['RMSE'])
-        local_maes.append(m_dict['MAE'])
-        local_accs.append(m_dict['Pairwise_Correlation'])
-    result['Local'] = {
-        'RMSE': float(np.mean(local_rmses)),
-        'MAE': float(np.mean(local_maes)),
-        'Pairwise_Correlation': float(np.mean(local_accs)),
-        'Time': float(time.time() - t0)
-    }
+    theta_local_0 = theta0_list[0]
+    result['Local'] = get_metrics_ranking(theta_local_0, theta_true, X, Y, quantiles, time.time() - t0)
+    result['Local']['theta_hat'] = theta_local_0.flatten().tolist()
 
     if run_U_ADMM:
         t0 = time.time()
@@ -161,18 +142,12 @@ def run_single_aft(seed, params):
 
     # 1. 默认必跑：Avg 和 Local
     result['Avg'] = get_metrics_aft(theta_naive, theta_true, d_aft['X'], 0.0)
+    result['Avg']['theta_hat'] = theta_naive.flatten().tolist()
     
     t0 = time.time()
-    local_rmses, local_maes = [], []
-    for th in theta0_list:
-        m_dict = get_metrics_aft(th, theta_true, d_aft['X'], 0)
-        local_rmses.append(m_dict['RMSE'])
-        local_maes.append(m_dict['MAE'])
-    result['Local'] = {
-        'RMSE': float(np.mean(local_rmses)),
-        'MAE': float(np.mean(local_maes)),
-        'Time': float(time.time() - t0)
-    }
+    theta_local_0 = theta0_list[0]
+    result['Local'] = get_metrics_aft(theta_local_0, theta_true, d_aft['X'], time.time() - t0)
+    result['Local']['theta_hat'] = theta_local_0.flatten().tolist()
 
     if run_U_ADMM:
         t0 = time.time()

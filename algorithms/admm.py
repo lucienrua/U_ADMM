@@ -4,14 +4,15 @@ from utils.math_utils import soft_threshold, _proj_sphere
 from models.ranking import rank_grad, rank_loss, rank_hess, ranking_pairs
 from models.aft import aft_grad, aft_loss, aft_hess_diag, aft_pairs
 
-def local_gd(grad_fn, loss_fn, init_theta, n_iter=300, lr_init=0.5, project=False, lam=0.0, theta_true=None):
+def local_gd(grad_fn, loss_fn, init_theta, n_iter=300, lr_init=0.5, project=False, lam=0.0, theta_true=None, project_end=False):
     """
     Proximal Gradient Descent with Armijo line search.
     """
     theta = init_theta.copy()
     history = {'rmse': []}
     if theta_true is not None:
-        history['rmse'].append(float(np.linalg.norm(theta - theta_true)))
+        record_th = _proj_sphere(theta) if project_end else theta
+        history['rmse'].append(float(np.linalg.norm(record_th - theta_true)))
     for _ in range(n_iter):
         g = grad_fn(theta)
         l0 = loss_fn(theta)
@@ -33,7 +34,12 @@ def local_gd(grad_fn, loss_fn, init_theta, n_iter=300, lr_init=0.5, project=Fals
         if project: cand = _proj_sphere(cand)
         theta = cand
         if theta_true is not None:
-            history['rmse'].append(float(np.linalg.norm(theta - theta_true)))
+            record_th = _proj_sphere(theta) if project_end else theta
+            history['rmse'].append(float(np.linalg.norm(record_th - theta_true)))
+            
+    if project_end:
+        theta = _proj_sphere(theta)
+        
     if theta_true is not None:
         return theta, history
     return theta

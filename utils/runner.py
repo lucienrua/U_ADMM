@@ -21,6 +21,9 @@ def get_metrics_ranking(theta, theta_true, X, Y, quantiles, t_cost):
     return {
         'RMSE': metrics['RMSE'],
         'MAE': metrics['MAE'],
+        'F1_Score': metrics['F1_Score'],
+        'Precision': metrics['Precision'],
+        'Recall': metrics['Recall'],
         'Pairwise_Correlation': float(acc_dict['Pairwise_Correlation']),
         'Total_Pairs': acc_dict['Total_Pairs'],
         'Correct_Pairs': acc_dict['Correct_Pairs'],
@@ -34,6 +37,9 @@ def get_metrics_aft(theta, theta_true, X, t_cost):
     return {
         'RMSE': metrics['RMSE'],
         'MAE': metrics['MAE'],
+        'F1_Score': metrics['F1_Score'],
+        'Precision': metrics['Precision'],
+        'Recall': metrics['Recall'],
         'Pairwise_Correlation': (corr_dict['Kendall_Corr'] + 1) / 2.0,
         'Time': float(t_cost)
     }
@@ -66,11 +72,24 @@ def run_single_ranking(seed, params):
     result['Avg'] = get_metrics_ranking(theta_naive, theta_true, X, Y, quantiles, 0.0)
     result['Avg']['theta_hat'] = theta_naive.flatten().tolist()
     
-    # Local: 对应第一个节点的系数估计 (theta0_list[0])
+    # Local: RMSE等指标取所有节点的平均值 (以保证与算法初始起点完全对齐), 散点图的系数 theta_hat 取第一个节点
     t0 = time.time()
-    theta_local_0 = theta0_list[0]
-    result['Local'] = get_metrics_ranking(theta_local_0, theta_true, X, Y, quantiles, time.time() - t0)
-    result['Local']['theta_hat'] = theta_local_0.flatten().tolist()
+    local_rmses, local_maes, local_accs = [], [], []
+    for th in theta0_list:
+        m_dict = get_metrics_ranking(th, theta_true, X, Y, quantiles, 0)
+        local_rmses.append(m_dict['RMSE'])
+        local_maes.append(m_dict['MAE'])
+        local_accs.append(m_dict['Pairwise_Correlation'])
+    result['Local'] = {
+        'RMSE': float(np.mean(local_rmses)),
+        'MAE': float(np.mean(local_maes)),
+        'F1_Score': float(np.mean([calculate_metrics(theta_true, th)['F1_Score'] for th in theta0_list])),
+        'Precision': float(np.mean([calculate_metrics(theta_true, th)['Precision'] for th in theta0_list])),
+        'Recall': float(np.mean([calculate_metrics(theta_true, th)['Recall'] for th in theta0_list])),
+        'Pairwise_Correlation': float(np.mean(local_accs)),
+        'Time': float(time.time() - t0),
+        'theta_hat': theta0_list[0].flatten().tolist()
+    }
 
     if run_U_ADMM:
         t0 = time.time()
@@ -145,9 +164,17 @@ def run_single_aft(seed, params):
     result['Avg']['theta_hat'] = theta_naive.flatten().tolist()
     
     t0 = time.time()
-    theta_local_0 = theta0_list[0]
-    result['Local'] = get_metrics_aft(theta_local_0, theta_true, d_aft['X'], time.time() - t0)
-    result['Local']['theta_hat'] = theta_local_0.flatten().tolist()
+    local_rmses, local_maes = [], []
+    for th in theta0_list:
+        m_dict = get_metrics_aft(th, theta_true, d_aft['X'], 0)
+        local_rmses.append(m_dict['RMSE'])
+        local_maes.append(m_dict['MAE'])
+    result['Local'] = {
+        'RMSE': float(np.mean(local_rmses)),
+        'MAE': float(np.mean(local_maes)),
+        'Time': float(time.time() - t0),
+        'theta_hat': theta0_list[0].flatten().tolist()
+    }
 
     if run_U_ADMM:
         t0 = time.time()

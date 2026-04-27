@@ -333,10 +333,11 @@ def run_dgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_in
     return np.mean(theta, axis=0)
 
 def run_d_proxgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', 
-             theta_init_list=None, return_history=False, decay_interval=100, decay_rate=0.5):
+             theta_init_list=None, return_history=False, decay_rate=0.96):
     """
     D-ProxGD (Decentralized Proximal Gradient Descent)
-    【修复版】：恢复了阶梯衰减机制，保证前期强力去噪，后期高精度收敛。
+    【修复版】：引入指数衰减机制 (decay_rate=0.96)，
+    确保算法在接近真实解时能够稳定收敛，防止步长过大导致的震荡。
     """
     m = data['m']
     p = data['p']
@@ -398,8 +399,8 @@ def run_d_proxgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic',
         for lam_cand in sorted(lambda_candidates, reverse=True):
             theta = [th.copy() for th in init_theta]
             for t in range(T):
-                # 阶梯衰减逻辑
-                current_lr = lr * (decay_rate ** (t // decay_interval))
+                # 🔴 核心修复：应用指数衰减，防止反弹
+                current_lr = lr * (decay_rate ** t)
                 theta = _step(theta, lam_cand, current_lr)
                 
             ic_val = compute_ic(theta, data, ic_type=ic_type)
@@ -417,13 +418,17 @@ def run_d_proxgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic',
             float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)])))
 
     for t in range(T):
-        # 同样的阶梯衰减逻辑
-        current_lr = lr * (decay_rate ** (t // decay_interval))
+        # 🔴 核心修复：正式运行也应用指数衰减
+        current_lr = lr * (decay_rate ** t)
         theta = _step(theta, best_lam, current_lr)
         
         if return_history and theta_true is not None:
             hist_final['rmse'].append(
                 float(np.mean([np.linalg.norm(theta[j] - theta_true) for j in range(m)])))
+
+    if return_history:
+        return np.mean(theta, axis=0), hist_final
+    return np.mean(theta, axis=0)
 
     if return_history:
         return np.mean(theta, axis=0), hist_final

@@ -46,13 +46,19 @@ def generate_ranking_data(m, n, p_prime, p, pc, noise_type='normal', rng_seed=No
     # 归一化到单位球面：估计量受 ||theta||_2=1 约束，真实参数须保持一致量纲
     theta_true = v / np.linalg.norm(v)
 
-    # 协方差矩阵：对角元为 1，非对角元为 0.5
-    Sigma = 0.5 * np.ones((p, p))
-    np.fill_diagonal(Sigma, 1.0)
+    # 协方差矩阵： AR(1) 结构生成
+    sigma_sq = 1.0
+    rho = 0.1
+    # 生成维度索引序列 [0, 1, ..., p-1]
+    indices = np.arange(p)
+    # 利用 NumPy 广播机制计算任意两个索引之间的绝对距离 |i - j|
+    distance_matrix = np.abs(indices[:, None] - indices[None, :])
+    # 根据公式 Sigma_ij = sigma^2 * rho^{|i-j|} 计算协方差矩阵
+    Sigma = sigma_sq * (rho ** distance_matrix)
 
     # 用 50000 个先验样本估计全局分位点（使五个类别等频）
     Xp = np.random.multivariate_normal(np.zeros(p), Sigma, 50_000)
-    # 【修改处 1】：在估计分位点的全局数据生成时，乘以 noise_scale
+    # 在估计分位点的全局数据生成时，乘以 noise_scale
     tp = Xp @ theta_true.flatten() + generate_noise(noise_type, 50_000) * noise_scale
     quantiles = np.percentile(tp, [20, 40, 60, 80])  # 四个切点 t1,...,t4
 

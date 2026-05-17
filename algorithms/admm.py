@@ -4,7 +4,7 @@ from utils.math_utils import soft_threshold, _proj_sphere
 from models.ranking import rank_grad, rank_loss, rank_hess, ranking_pairs
 from models.aft import aft_grad, aft_loss, aft_hess_diag, aft_pairs
 
-def local_gd(grad_fn, loss_fn, init_theta, n_iter=300, lr_init=0.5, project=False, lam=0.0, theta_true=None, project_end=False):
+def local_gd(grad_fn, loss_fn, init_theta, n_iter=500, lr_init=0.5, project=False, lam=0.0, theta_true=None, project_end=False):
     """
     Proximal Gradient Descent with Armijo line search.
     """
@@ -96,7 +96,7 @@ def init_all_nodes(data):
             gfn = lambda th, dX=dX, dlogTt=dlogTt, r2=r2, r=r, di=di, dj=dj, n=n_val: aft_grad(th, dX, dlogTt, r2, r, di, dj, n)
             lfn = lambda th, dX=dX, dlogTt=dlogTt, r2=r2, r=r, di=di, dj=dj, n=n_val: aft_loss(th, dX, dlogTt, r2, r, di, dj, n)
             init = np.zeros((p, 1))
-            th = local_gd(gfn, lfn, init, n_iter=300, lr_init=0.5, project=False)
+            th = local_gd(gfn, lfn, init, n_iter=500, lr_init=0.5, project=False)
         theta0_list.append(th)
 
     theta_naive = np.mean(np.hstack(theta0_list), axis=1, keepdims=True)

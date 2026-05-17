@@ -100,14 +100,21 @@ def generate_aft_data(m, n, p, p_prime, pc, cens_target=0.25, noise_type='gumbel
                 noise_type=noise_type,
                 task='aft')
 
+import numpy as np
+import scipy.special as sp_special  # 引入底层 C 加速函数
+
 def aft_pairs(X, logTt, delta, Sigma, base_n=None):
     n = X.shape[0]
     if base_n is None:
         base_n = n
+    from itertools import combinations
     ii, jj = map(np.array, zip(*combinations(range(n), 2)))
     dX = X[ii] - X[jj]
     dlogTt = logTt[jj] - logTt[ii]
-    r2 = np.maximum(np.einsum('ij,jk,ik->i', dX, Sigma, dX) / base_n, 1e-8)
+    
+    # 【优化 3】：使用点乘加横向求和替代 einsum，强制调用 BLAS 库
+    r2 = np.maximum(np.sum((dX @ Sigma) * dX, axis=1) / base_n, 1e-8)
+    
     r = np.sqrt(r2)
     di = delta[ii]
     dj = delta[jj]
@@ -116,14 +123,22 @@ def aft_pairs(X, logTt, delta, Sigma, base_n=None):
 def aft_grad(theta, dX, dlogTt, r2, r, di, dj, n):
     de = dlogTt + (dX @ theta).flatten()
     z = de / r
-    Phi = sp_norm.cdf(z)
-    g = (di * Phi).reshape(-1, 1) * dX - (dj * (1 - Phi)).reshape(-1, 1) * dX
-    return g.sum(axis=0).reshape(-1, 1) * 2.0 / (n * (n - 1))
+    
+    # 【优化 2】：使用极速的 ndtr 替代 stats.norm.cdf
+    Phi = sp_special.ndtr(z)
+    
+    # 【优化 1】：将内存爆炸的广播机制转换为极致的矩阵向量乘法 (dX.T @ w)
+    w = di * Phi - dj * (1.0 - Phi)
+    return (dX.T @ w).reshape(-1, 1) * 2.0 / (n * (n - 1))
 
 def aft_hess_diag(theta, dX, dlogTt, r2, r, di, dj, n):
     de = dlogTt + (dX @ theta).flatten()
     z = de / r
-    phi = sp_norm.pdf(z)
+    
+    # 【优化 2】：手写正态分布 PDF，绕过 scipy.stats 的对象开销
+    # 2.5066282746310002 是 sqrt(2 * pi) 的精确值
+    phi = np.exp(-0.5 * z**2) / 2.5066282746310002  
+    
     w = (di + dj) * phi / r
     H = (dX.T * w) @ dX * 2.0 / (n * (n - 1))
     return float(np.linalg.eigvalsh(H).max()) + 1e-3
@@ -131,6 +146,12 @@ def aft_hess_diag(theta, dX, dlogTt, r2, r, di, dj, n):
 def aft_loss(theta, dX, dlogTt, r2, r, di, dj, n):
     de = dlogTt + (dX @ theta).flatten()
     z = de / r
-    term_ij = di * (de * sp_norm.cdf(z) + r * sp_norm.pdf(z))
-    term_ji = dj * (-de * sp_norm.cdf(-z) + r * sp_norm.pdf(-z))
+    
+    # 【优化 2】：全面替换慢速函数
+    Phi = sp_special.ndtr(z)
+    Phi_neg = sp_special.ndtr(-z)
+    phi = np.exp(-0.5 * z**2) / 2.5066282746310002
+    
+    term_ij = di * (de * Phi + r * phi)
+    term_ji = dj * (-de * Phi_neg + r * phi)
     return float(np.sum(term_ij + term_ji) * 2.0 / (n * (n - 1)))

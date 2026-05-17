@@ -78,7 +78,7 @@ from algorithms.admm import local_gd, compute_ic
 #         best_theta = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=lr, project=project, lam=best_lam)
 #         return best_theta
 # #以上的方法是继承制lam，以下的算法是并行lam
-def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False, tol=1e-5):
+def run_global_u_erm(data, lr=0.5, n_iter=500, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False, tol=1e-5):
     """
     Pool (Global U-ERM): 将所有本地数据汇总到一台机器上。
     重写修复版：

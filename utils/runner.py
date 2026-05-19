@@ -141,7 +141,7 @@ def run_single_aft(seed, params):
     np.random.seed(seed)
     d_aft = generate_aft_data(
         m=params['m'], n=params['n'], p_prime=params.get('p_prime', 5), p=params['p'], 
-        pc=params['pc'], noise_type=params['noise_type'], rng_seed=seed,noise_scale=params.get('noise_scale', 1.0)
+        pc=params['pc'], cens_target=params.get('cens_target', 0.25), noise_type=params['noise_type'], rng_seed=seed,noise_scale=params.get('noise_scale', 1.0)
     )
     
     theta_true = d_aft['theta_true']

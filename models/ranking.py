@@ -48,7 +48,7 @@ def generate_ranking_data(m, n, p_prime, p, pc, noise_type='normal', rng_seed=No
 
     # 协方差矩阵： AR(1) 结构生成
     sigma_sq = 1.0
-    rho = 0.1
+    rho = 0.5
     # 生成维度索引序列 [0, 1, ..., p-1]
     indices = np.arange(p)
     # 利用 NumPy 广播机制计算任意两个索引之间的绝对距离 |i - j|

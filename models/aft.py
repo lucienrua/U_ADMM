@@ -20,7 +20,7 @@ def generate_noise(noise_type, size):
     else:
         return np.random.normal(0, 1, size)
 
-def generate_aft_data(m, n, p, p_prime, pc, cens_target=0.25, noise_type='gumbel', rng_seed=None):
+def generate_aft_data(m, n, p, p_prime, pc, cens_target=0.25, noise_type='gumbel', rng_seed=None, noise_scale=1.0):
     """
     生成论文 Section 7.2.1 的 AFT（加速失效时间）仿真数据。
     数据生成模型：
@@ -48,7 +48,7 @@ def generate_aft_data(m, n, p, p_prime, pc, cens_target=0.25, noise_type='gumbel
     # 用先验样本确定删失时间上界 tau
     # 固定先验样本，避免二分搜索过程中随机噪声干扰收敛
     Xp = np.random.multivariate_normal(np.zeros(p), Sigma, 5000)
-    logT_p = Xp @ theta_true.flatten() + generate_noise(noise_type, 5000)
+    logT_p = Xp @ theta_true.flatten() + generate_noise(noise_type, 5000) * noise_scale
     
     # 防止 Cauchy 噪声等产生极值导致 exp 溢出
     logT_p = np.clip(logT_p, -100, 100)
@@ -76,7 +76,7 @@ def generate_aft_data(m, n, p, p_prime, pc, cens_target=0.25, noise_type='gumbel
     X_list, logTt_list, delta_list = [], [], []
     for _ in range(m):
         Xj = np.random.multivariate_normal(np.zeros(p), Sigma, n)
-        logTj = Xj @ theta_true.flatten() + generate_noise(noise_type, n)
+        logTj = Xj @ theta_true.flatten() + generate_noise(noise_type, n) * noise_scale
         
         # 同样防止溢出
         logTj = np.clip(logTj, -100, 100)

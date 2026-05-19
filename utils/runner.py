@@ -12,7 +12,7 @@ from models.ranking import generate_ranking_data
 from models.aft import generate_aft_data
 from algorithms.admm import run_u_admm, init_all_nodes
 from algorithms.baselines import run_global_u_erm, run_dgd, run_d_proxgd
-from utils.eval_utils import evaluate_ranking_accuracy, calculate_metrics, evaluate_correlation
+from utils.eval_utils import evaluate_ranking_accuracy, calculate_metrics, evaluate_correlation, calculate_c_index
 
 def get_metrics_ranking(theta, theta_true, X, Y, quantiles, t_cost):
     metrics = calculate_metrics(theta_true, theta)
@@ -30,9 +30,9 @@ def get_metrics_ranking(theta, theta_true, X, Y, quantiles, t_cost):
         'Time': float(t_cost)
     }
 
-def get_metrics_aft(theta, theta_true, X, t_cost):
+def get_metrics_aft(theta, theta_true, d_aft, t_cost):
     metrics = calculate_metrics(theta_true, theta)
-    corr_dict = evaluate_correlation(X, theta_true, theta)
+    c_index = calculate_c_index(d_aft['X'], d_aft['logTt'], d_aft['delta'], theta)
     
     return {
         'RMSE': metrics['RMSE'],
@@ -40,7 +40,8 @@ def get_metrics_aft(theta, theta_true, X, t_cost):
         'F1_Score': metrics['F1_Score'],
         'Precision': metrics['Precision'],
         'Recall': metrics['Recall'],
-        'Pairwise_Correlation': (corr_dict['Kendall_Corr'] + 1) / 2.0,
+        'Pairwise_Correlation': c_index,
+        'C_Index': c_index,
         'Time': float(t_cost)
     }
 
@@ -160,18 +161,21 @@ def run_single_aft(seed, params):
     run_D_ProxGD = params.get('run_D_ProxGD', True)
 
     # 1. 默认必跑：Avg 和 Local
-    result['Avg'] = get_metrics_aft(theta_naive, theta_true, d_aft['X'], 0.0)
+    result['Avg'] = get_metrics_aft(theta_naive, theta_true, d_aft, 0.0)
     result['Avg']['theta_hat'] = theta_naive.flatten().tolist()
     
     t0 = time.time()
-    local_rmses, local_maes = [], []
+    local_rmses, local_maes, local_c_indices = [], [], []
     for th in theta0_list:
-        m_dict = get_metrics_aft(th, theta_true, d_aft['X'], 0)
+        m_dict = get_metrics_aft(th, theta_true, d_aft, 0)
         local_rmses.append(m_dict['RMSE'])
         local_maes.append(m_dict['MAE'])
+        local_c_indices.append(m_dict['C_Index'])
     result['Local'] = {
         'RMSE': float(np.mean(local_rmses)),
         'MAE': float(np.mean(local_maes)),
+        'Pairwise_Correlation': float(np.mean(local_c_indices)),
+        'C_Index': float(np.mean(local_c_indices)),
         'Time': float(time.time() - t0),
         'theta_hat': theta0_list[0].flatten().tolist()
     }
@@ -186,7 +190,7 @@ def run_single_aft(seed, params):
             theta0_list=theta0_list
         )
         t_uadmm = time.time() - t0
-        result['U-ADMM'] = get_metrics_aft(theta_u_a[0], theta_true, d_aft['X'], t_uadmm)
+        result['U-ADMM'] = get_metrics_aft(theta_u_a[0], theta_true, d_aft, t_uadmm)
         result['U-ADMM']['hist_rmse'] = hist_a['rmse']
         result['U-ADMM']['theta_hat'] = theta_u_a[0].flatten().tolist()
         
@@ -195,7 +199,7 @@ def run_single_aft(seed, params):
         total_iters = params['T'] * params['W_inner']
         theta_global, hist_global = run_global_u_erm(d_aft, n_iter=total_iters, lambda_candidates=lambda_candidates, ic_type=ic_type, init_theta=theta_naive, return_history=True)
         t_global = time.time() - t0
-        result['Global'] = get_metrics_aft(theta_global, theta_true, d_aft['X'], t_global)
+        result['Global'] = get_metrics_aft(theta_global, theta_true, d_aft, t_global)
         result['Global']['hist_rmse'] = hist_global['rmse']
         result['Global']['theta_hat'] = theta_global.flatten().tolist()
         
@@ -203,7 +207,7 @@ def run_single_aft(seed, params):
         t0 = time.time()
         theta_dgd, hist_dgd = run_dgd(d_aft, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=theta0_list, return_history=True)
         t_dgd = time.time() - t0
-        result['D-subGD'] = get_metrics_aft(theta_dgd, theta_true, d_aft['X'], t_dgd)
+        result['D-subGD'] = get_metrics_aft(theta_dgd, theta_true, d_aft, t_dgd)
         result['D-subGD']['hist_rmse'] = hist_dgd['rmse']
         result['D-subGD']['theta_hat'] = theta_dgd.flatten().tolist()
 
@@ -213,7 +217,7 @@ def run_single_aft(seed, params):
         d_proxgd_lambdas = params.get('lambda_d_proxgd', lambda_candidates)
         theta_d_proxgd, hist_d_proxgd = run_d_proxgd(d_aft, T=params['T'] * params['W_inner'], lr=d_proxgd_lr, lambda_candidates=d_proxgd_lambdas, ic_type=ic_type, theta_init_list=theta0_list, return_history=True)
         t_d_proxgd = time.time() - t0
-        result['D-ProxGD'] = get_metrics_aft(theta_d_proxgd, theta_true, d_aft['X'], t_d_proxgd)
+        result['D-ProxGD'] = get_metrics_aft(theta_d_proxgd, theta_true, d_aft, t_d_proxgd)
         result['D-ProxGD']['hist_rmse'] = hist_d_proxgd['rmse']
         result['D-ProxGD']['theta_hat'] = theta_d_proxgd.flatten().tolist()
 

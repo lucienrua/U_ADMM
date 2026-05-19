@@ -38,6 +38,42 @@ def evaluate_correlation(X_list, theta_true, theta_hat):
         'Kendall_Corr': float(kendall_corr)
     }
 
+def calculate_c_index(X, logTt, delta, theta_hat):
+    if isinstance(X, list):
+        X = np.vstack(X)
+    if isinstance(logTt, list):
+        logTt = np.concatenate(logTt)
+    if isinstance(delta, list):
+        delta = np.concatenate(delta)
+        
+    scores = X @ theta_hat.flatten()
+    
+    diff_logTt = np.subtract.outer(logTt, logTt)
+    diff_scores = np.subtract.outer(scores, scores)
+    
+    n = len(logTt)
+    mask_triu = np.triu(np.ones((n, n), dtype=bool), k=1)
+    
+    delta_i = np.broadcast_to(delta[:, None], (n, n))
+    delta_j = np.broadcast_to(delta[None, :], (n, n))
+    
+    cond1 = (delta_i == 1) & (delta_j == 1) & (diff_logTt != 0)
+    cond2 = (delta_i == 1) & (delta_j == 0) & (diff_logTt < 0)
+    cond3 = (delta_i == 0) & (delta_j == 1) & (diff_logTt > 0)
+    
+    comparable = (cond1 | cond2 | cond3) & mask_triu
+    total_comparable = np.sum(comparable)
+    
+    if total_comparable == 0:
+        return 0.0
+        
+    true_sign = np.sign(diff_logTt[comparable])
+    pred_sign = np.sign(diff_scores[comparable])
+    
+    correct = np.sum(true_sign == pred_sign)
+    
+    return float(correct / total_comparable)
+
 def calculate_metrics(theta_true, theta_hat, threshold=1e-4):
     rmse = np.linalg.norm(theta_true - theta_hat)
     mae = np.mean(np.abs(theta_true - theta_hat))

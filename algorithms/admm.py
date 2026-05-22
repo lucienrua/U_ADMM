@@ -80,9 +80,10 @@ def init_all_nodes(data):
                     ranking_pairs(data['X'][j], data['Y'][j])
                 )
             else:
+                N_total = data.get('N_total', m * data['n'])
                 data['precomputed_pairs'].append(
                     aft_pairs(data['X'][j], data['logTt'][j],
-                              data['delta'][j], data['Sigma'])
+                              data['delta'][j], data['Sigma'], base_n=N_total)
                 )
 
     theta0_list = []
@@ -277,7 +278,8 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
             if task == 'ranking':
                 data['precomputed_pairs'].append(ranking_pairs(data['X'][j], data['Y'][j]))
             else:
-                data['precomputed_pairs'].append(aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma']))
+                N_total = data.get('N_total', m * data['n'])
+                data['precomputed_pairs'].append(aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'], base_n=N_total))
 
     # 初始化
     if theta0_list is not None:
@@ -289,17 +291,17 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
         init_theta_t, theta_naive = init_all_nodes(data)
 
     # =========================================================
-    # 预计算区：标量近似 + 松弛因子极速加速
+    # 预计算区：标量近似（恢复严格理论界）
     # =========================================================
     theoretical_rho_list = []
-    H_scale = 25.0  # 核心加速器：将理论最严苛的约束缩小 15 倍
+    H_scale = 1.0  # 恢复严格理论界，确保近端项的半正定保证，与 Global 尺度完全对齐
 
     for j in range(m):
         X_j = data['X'][j]
         cov_j = (X_j.T @ X_j) / X_j.shape[0]
         max_eig = float(np.linalg.eigvalsh(cov_j).max())
         
-        # 将上限标量缩小 H_scale 倍，极大提升等效学习率
+        # 恢复理论安全的近端项惩罚系数
         rho_j = (max_eig / H_scale) + 1e-3 
         theoretical_rho_list.append(rho_j)
 

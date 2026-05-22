@@ -61,6 +61,7 @@ def run_single_ranking(seed, params):
     result = {'seed': seed, 'noise_type': params['noise_type']}
     
     lambda_candidates = params.get('lambda_candidates', [0.1, 0.05, 0.01, 0.005, 0.001])
+    lambda_global = params.get('lambda_global', lambda_candidates)
     ic_type = params.get('ic_type', 'bic')
 
     run_U_ADMM = params.get('run_U_ADMM', True)
@@ -110,7 +111,7 @@ def run_single_ranking(seed, params):
         t0 = time.time()
         total_iters = params['T'] * params['W_inner']
         # 传递 theta_naive 作为 Global 的初始化点
-        theta_global, hist_global = run_global_u_erm(d_rank, n_iter=total_iters, lambda_candidates=lambda_candidates, ic_type=ic_type, init_theta=theta_naive, return_history=True)
+        theta_global, hist_global = run_global_u_erm(d_rank, n_iter=total_iters, lambda_candidates=lambda_global, ic_type=ic_type, init_theta=theta_naive, return_history=True)
         t_global = time.time() - t0
         result['Global'] = get_metrics_ranking(theta_global, theta_true, X, Y, quantiles, t_global)
         result['Global']['hist_rmse'] = hist_global['rmse']
@@ -153,6 +154,7 @@ def run_single_aft(seed, params):
     result = {'seed': seed, 'noise_type': params['noise_type']}
     
     lambda_candidates = params.get('lambda_candidates', [0.1, 0.05, 0.01, 0.005, 0.001])
+    lambda_global = params.get('lambda_global', lambda_candidates)
     ic_type = params.get('ic_type', 'bic')
 
     run_U_ADMM = params.get('run_U_ADMM', True)
@@ -197,7 +199,7 @@ def run_single_aft(seed, params):
     if run_Global:
         t0 = time.time()
         total_iters = params['T'] * params['W_inner']
-        theta_global, hist_global = run_global_u_erm(d_aft, n_iter=total_iters, lambda_candidates=lambda_candidates, ic_type=ic_type, init_theta=theta_naive, return_history=True)
+        theta_global, hist_global = run_global_u_erm(d_aft, n_iter=total_iters, lambda_candidates=lambda_global, ic_type=ic_type, init_theta=theta_naive, return_history=True)
         t_global = time.time() - t0
         result['Global'] = get_metrics_aft(theta_global, theta_true, d_aft, t_global)
         result['Global']['hist_rmse'] = hist_global['rmse']

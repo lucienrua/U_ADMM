@@ -25,7 +25,7 @@ def generate_aft_data(m, n, p, p_prime, pc, cens_target=0.25, noise_type='gumbel
     生成论文 Section 7.2.1 的 AFT（加速失效时间）仿真数据。
     数据生成模型：
         log(T_i) = X_i^T theta* + zeta_i
-        X_i ~ N(0, Sigma),  Sigma_kl = 0.5^|k-l|
+        X_i ~ N(0, Sigma),  Sigma_kl = 1 if k==l else 0.5
         zeta_i ~ 指定噪声分布
         C_i ~ Uniform(0, tau)，tau 通过二分查找使删失率 ≈ cens_target
         theta* = (1, 1, ..., 1)^T
@@ -42,8 +42,9 @@ def generate_aft_data(m, n, p, p_prime, pc, cens_target=0.25, noise_type='gumbel
     theta_true = np.zeros((p, 1))
     theta_true[:p_prime, 0] = 1.0
 
-    # 协方差矩阵：Sigma_kl = 0.5^|k-l|（Toeplitz 结构）
-    Sigma = np.array([[0.5**abs(i - j) for j in range(p)] for i in range(p)])
+    # 协方差矩阵：对角线为1，非对角线为0.5
+    Sigma = np.full((p, p), 0.5)
+    np.fill_diagonal(Sigma, 1.0)
 
     # 用先验样本确定删失时间上界 tau
     # 固定先验样本，避免二分搜索过程中随机噪声干扰收敛
@@ -92,7 +93,7 @@ def generate_aft_data(m, n, p, p_prime, pc, cens_target=0.25, noise_type='gumbel
 
     avg_cens = 1.0 - float(np.mean([d.mean() for d in delta_list]))
 
-    return dict(m=m, n=n, p=p,
+    return dict(m=m, n=n, p=p, N_total=m*n,
                 theta_true=theta_true,
                 X=X_list, logTt=logTt_list, delta=delta_list,
                 W=W, G=G, Sigma=Sigma,

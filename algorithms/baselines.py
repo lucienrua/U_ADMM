@@ -82,35 +82,59 @@ def run_global_u_erm(data, lr=0.5, n_iter=500, lambda_candidates=None, ic_type='
     """
     Pool (Global U-ERM): 将所有本地数据汇总到一台机器上。
     重写修复版：
-    1. 移除错误的 H_scale=25.0 放大，恢复正常的 lambda 惩罚尺度。
-    2. 恢复 L1 路径调参的连续热启动 (Warm Start) 机制。
-    3. 清洗投影带来的底噪，保证稀疏结构的纯净度。
+    1. 采用 Pooled 策略，计算节点级 loss/grad 然后取平均，确保与 U-ADMM 理论目标尺度完全一致。
+    2. 移除错误的 H_scale=25.0 放大，恢复正常的 lambda 惩罚尺度。
+    3. 恢复 L1 路径调参的连续热启动 (Warm Start) 机制。
+    4. 清洗投影带来的底噪，保证稀疏结构的纯净度。
     """
     task = data['task']
     p = data['p']
+    m = data['m']
     theta_true = data.get('theta_true', None) if return_history else None
     
+    local_pairs = []
+    N_total = data.get('N_total', m * data['n'])
+    for j in range(m):
+        if task == 'ranking':
+            from models.ranking import ranking_pairs
+            dX, S = ranking_pairs(data['X'][j], data['Y'][j])
+            local_pairs.append((dX, S))
+        elif task == 'aft':
+            from models.aft import aft_pairs
+            dX, dlogTt, r2, r, di, dj_idx, n_val = aft_pairs(
+                data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'], base_n=N_total)
+            local_pairs.append((dX, dlogTt, r2, r, di, dj_idx, n_val))
+
+    def gfn(th):
+        grad_sum = np.zeros_like(th)
+        for j in range(m):
+            if task == 'ranking':
+                from models.ranking import rank_grad
+                dX, S = local_pairs[j]
+                grad_sum += rank_grad(th, dX, S)
+            else:
+                from models.aft import aft_grad
+                dX, dlogTt, r2, r, di, dj_idx, n_val = local_pairs[j]
+                grad_sum += aft_grad(th, dX, dlogTt, r2, r, di, dj_idx, n_val)
+        return grad_sum / m
+
+    def lfn(th):
+        loss_sum = 0.0
+        for j in range(m):
+            if task == 'ranking':
+                from models.ranking import rank_loss
+                dX, S = local_pairs[j]
+                loss_sum += rank_loss(th, dX, S)
+            else:
+                from models.aft import aft_loss
+                dX, dlogTt, r2, r, di, dj_idx, n_val = local_pairs[j]
+                loss_sum += aft_loss(th, dX, dlogTt, r2, r, di, dj_idx, n_val)
+        return loss_sum / m
+
     if task == 'ranking':
-        X_all = np.vstack(data['X'])
-        Y_all = np.concatenate(data['Y'])
-        dX, S = ranking_pairs(X_all, Y_all)
-        
-        gfn = lambda th: rank_grad(th, dX, S)
-        lfn = lambda th: rank_loss(th, dX, S)
         init = init_theta.copy() if init_theta is not None else np.ones((p, 1)) / np.sqrt(p)
         project = True
-        
-    elif task == 'aft':
-        X_all = np.vstack(data['X'])
-        logTt_all = np.concatenate(data['logTt'])
-        delta_all = np.concatenate(data['delta'])
-        Sigma = data['Sigma']
-        
-        # AFT任务由于全局数据量巨大，注意传入正确的 base_n 确保除数不出错
-        dX, dlogTt, r2, r, di, dj, n_val = aft_pairs(X_all, logTt_all, delta_all, Sigma, base_n=X_all.shape[0])
-        
-        gfn = lambda th: aft_grad(th, dX, dlogTt, r2, r, di, dj, n_val)
-        lfn = lambda th: aft_loss(th, dX, dlogTt, r2, r, di, dj, n_val)
+    else:
         init = init_theta.copy() if init_theta is not None else np.zeros((p, 1))
         project = False
         
@@ -203,6 +227,7 @@ def run_dgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_in
     
     # 预计算本地 pairs 以加速
     local_pairs = []
+    N_total = data.get('N_total', m * data['n'])
     for j in range(m):
         if task == 'ranking':
             from models.ranking import ranking_pairs, rank_grad
@@ -210,7 +235,7 @@ def run_dgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_in
             local_pairs.append((dX, S))
         elif task == 'aft':
             from models.aft import aft_pairs, aft_grad
-            dX, dlogTt, r2, r, di, dj, n_val = aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'])
+            dX, dlogTt, r2, r, di, dj, n_val = aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'], base_n=N_total)
             local_pairs.append((dX, dlogTt, r2, r, di, dj, n_val))
             
     # 初始化：确保所有算法起跑线一致 (独立冷启动)
@@ -347,6 +372,7 @@ def run_d_proxgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic',
 
     # ── 预计算本地 pairs ──────────────────────────────────────────────
     local_pairs = []
+    N_total = data.get('N_total', m * data['n'])
     for j in range(m):
         if task == 'ranking':
             from models.ranking import ranking_pairs, rank_grad
@@ -355,7 +381,7 @@ def run_d_proxgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic',
         elif task == 'aft':
             from models.aft import aft_pairs, aft_grad
             dX, dlogTt, r2, r, di, dj_idx, n_val = aft_pairs(
-                data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'])
+                data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'], base_n=N_total)
             local_pairs.append((dX, dlogTt, r2, r, di, dj_idx, n_val))
 
     # ── 初始化起点 ────────────────────────────────────────────────────

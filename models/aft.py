@@ -42,9 +42,12 @@ def generate_aft_data(m, n, p, p_prime, pc, cens_target=0.25, noise_type='gumbel
     theta_true = np.zeros((p, 1))
     theta_true[:p_prime, 0] = 1.0
 
-    # 协方差矩阵：对角线为1，非对角线为0.5
-    Sigma = np.full((p, p), 0.5)
-    np.fill_diagonal(Sigma, 1.0)
+    # 协方差矩阵： AR(1) 结构生成
+    sigma_sq = 1.0
+    rho = 0.5
+    indices = np.arange(p)
+    distance_matrix = np.abs(indices[:, None] - indices[None, :])
+    Sigma = sigma_sq * (rho ** distance_matrix)
 
     # 用先验样本确定删失时间上界 tau
     # 固定先验样本，避免二分搜索过程中随机噪声干扰收敛

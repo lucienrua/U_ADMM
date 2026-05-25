@@ -80,10 +80,9 @@ def init_all_nodes(data):
                     ranking_pairs(data['X'][j], data['Y'][j])
                 )
             else:
-                N_total = data.get('N_total', m * data['n'])
                 data['precomputed_pairs'].append(
                     aft_pairs(data['X'][j], data['logTt'][j],
-                              data['delta'][j], data['Sigma'], base_n=N_total)
+                              data['delta'][j], data['Sigma'])
                 )
 
     theta0_list = []
@@ -125,8 +124,7 @@ def compute_agg_grad(j, theta_t_list, data):
 def inner_admm(theta_t_list, p_t_list, agg_grad_list, H_rho_list, W,
                rho, W_inner, lam_t=0.0, project=False):
     """
-    内层广义共识 ADMM
-    加入自适应 rho (Residual Balancing) 机制，实现免调参的极速收敛。
+    内层广义共识 ADMM (IEEE 2022 公式 (16a)+(17))。
     """
     m = W.shape[0]
     p = theta_t_list[0].shape[0]
@@ -137,103 +135,37 @@ def inner_admm(theta_t_list, p_t_list, agg_grad_list, H_rho_list, W,
     theta_w = [theta_t_list[j].copy() for j in range(m)]
     p_w = [p_t_list[j].copy() for j in range(m)]
 
-    # 动态计算 omega
     omega = [1.0 / (H_rho_list[j] + 2.0 * rho * dg[j]) for j in range(m)]
 
-    debug_info = {
-        'rho_before': rho,
-        'omega': omega,
-        'inner_theta': [],
-        'inner_numerator': [],
-        'consensus_gap': [],
-        'prim_res': [],  # 记录每步的原始残差
-        'dual_res': [],  # 记录每步的对偶残差
-        'rho_after': rho
-    }
-
     for _ in range(W_inner):
-        theta_prev = [th.copy() for th in theta_w]
-        
-        # 1. Dual Update (每次内循环先更新对偶变量)
+        # 1. Dual Update (公式 16a)
         p_new = []
-        consensus_gaps = []
         for j in range(m):
-            if nb[j]:
-                consensus_gap = sum(theta_w[j] - theta_w[k] for k in nb[j])
-            else:
-                consensus_gap = np.zeros((p, 1))
-            consensus_gaps.append(consensus_gap.copy())
+            consensus_gap = sum(theta_w[j] - theta_w[k] for k in nb[j]) if nb[j] else np.zeros((p, 1))
             p_new.append(p_w[j] + rho * consensus_gap)
         p_w = p_new
-        debug_info['consensus_gap'] = consensus_gaps
 
-        # 2. Primal Update
+        # 2. Primal Update (公式 17)
         theta_new = []
-        numerators = []
         for j in range(m):
             sum_nb = sum(theta_w[k] for k in nb[j]) if nb[j] else np.zeros((p, 1))
-            # 重大修改
-            # numerator = (
-            #         H_rho_list[j] * theta_w[j]  # 使用内层变量作为近端锚点
-            #         - agg_grad_list[j]
-            #         - p_w[j]
-            #         + rho * (dg[j] * theta_w[j] + sum_nb)
-            # )
             numerator = (
-                    H_rho_list[j] * theta_t_list[j]  # 修复：必须使用外层传入的固定锚点！
+                    H_rho_list[j] * theta_w[j]  # 内层当前迭代锚点 (IEEE 2022 公式(17): ρ_j·β_{v,t})
                     - agg_grad_list[j]
                     - p_w[j]
                     + rho * (dg[j] * theta_w[j] + sum_nb)
             )
-            numerators.append(numerator.copy())
             z_j = omega[j] * numerator
 
             if lam_t > 0:
                 z_j = soft_threshold(z_j, lam_t * omega[j])
-
-            if project: z_j = _proj_sphere(z_j)
+            if project:
+                z_j = _proj_sphere(z_j)
             theta_new.append(z_j)
 
         theta_w = theta_new
-        debug_info['inner_theta'].append([th.copy() for th in theta_w])
-        debug_info['inner_numerator'].append(numerators)
-        
-        # --- 3. Residual Balancing (残差平衡机制) ---
-        prim_res_sq = 0.0
-        dual_res_sq = 0.0
-        for j in range(m):
-            # 原始残差：当前最新参数的邻居分歧度
-            gap_j = sum(theta_w[j] - theta_w[k] for k in nb[j]) if nb[j] else np.zeros((p, 1))
-            prim_res_sq += np.sum(gap_j ** 2)
-            
-            # 对偶残差：本地参数在内循环前后的变化量近似
-            dual_res_sq += np.sum((rho * dg[j] * (theta_w[j] - theta_prev[j])) ** 2)
-            
-        prim_res = np.sqrt(prim_res_sq)
-        dual_res = np.sqrt(dual_res_sq)
-        
-        debug_info['prim_res'].append(prim_res)
-        debug_info['dual_res'].append(dual_res)
-        
-        # 动态调整 rho
-        mu = 10.0
-        tau = 1.1  # 使用 1.1 平滑调节，防止网络极度稀疏时发生剧烈震荡
-        
-        rho_changed = False
-        if prim_res > mu * dual_res:
-            rho = rho * tau
-            rho_changed = True
-        elif dual_res > mu * prim_res:
-            rho = rho / tau
-            rho_changed = True
-            
-        # 惩罚因子一旦改变，必须严格重算依赖于它的 omega 参数
-        if rho_changed:
-            omega = [1.0 / (H_rho_list[j] + 2.0 * rho * dg[j]) for j in range(m)]
-            
-    debug_info['rho_after'] = rho
 
-    return theta_w, p_w, rho, debug_info
+    return theta_w, p_w, rho
 
 def compute_ic(theta_list, data, ic_type='bic'):
     m = data['m']
@@ -278,34 +210,35 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
             if task == 'ranking':
                 data['precomputed_pairs'].append(ranking_pairs(data['X'][j], data['Y'][j]))
             else:
-                N_total = data.get('N_total', m * data['n'])
-                data['precomputed_pairs'].append(aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma'], base_n=N_total))
+                data['precomputed_pairs'].append(
+                    aft_pairs(data['X'][j], data['logTt'][j],
+                              data['delta'][j], data['Sigma'])
+                )
 
     # 初始化
     if theta0_list is not None:
-        init_theta_t = [th.copy() for th in theta0_list]
+        theta_t = [th.copy() for th in theta0_list]
         theta_naive = np.mean(np.hstack(theta0_list), axis=1, keepdims=True)
         if task == 'ranking':
             theta_naive = _proj_sphere(theta_naive)
     else:
-        init_theta_t, theta_naive = init_all_nodes(data)
+        theta_t_local, theta_naive = init_all_nodes(data)
+        theta_t = [th.copy() for th in theta_t_local]
 
-    # =========================================================
-    # 预计算区：标量近似（恢复严格理论界）
-    # =========================================================
+    # 基于 Proposition 1 预计算各节点理论步长（循环外固定）
+    # rho_j > lambda_max(n^-1 * X^T * X)
     theoretical_rho_list = []
-    H_scale = 1.0  # 恢复严格理论界，确保近端项的半正定保证，与 Global 尺度完全对齐
-
+    H_scale = 25.0
     for j in range(m):
         X_j = data['X'][j]
-        cov_j = (X_j.T @ X_j) / X_j.shape[0]
-        max_eig = float(np.linalg.eigvalsh(cov_j).max())
-        
-        # 恢复理论安全的近端项惩罚系数
-        rho_j = (max_eig / H_scale) + 1e-3 
+        n_j = X_j.shape[0]
+        cov_j = (X_j.T @ X_j) / n_j
+        rho_j = float(np.linalg.eigvalsh(cov_j).max() / H_scale) + 1e-3
         theoretical_rho_list.append(rho_j)
 
-    history = {'rmse': [], 'consensus': [], 'debug': []}
+    p_t = [np.zeros((p, 1)) for _ in range(m)]
+
+    history = {'rmse': [], 'consensus': []}
 
     def _record(th_list):
         rmse = float(np.mean([np.linalg.norm(th_list[j] - theta_true) for j in range(m)]))
@@ -315,87 +248,61 @@ def run_u_admm(data, T=5, W_inner=5, rho=0.1, lam_t=0.0, verbose=False,
         history['consensus'].append(ce)
         return rmse
 
-    if verbose:
-        print(f"  [Theory Rho] Mean={np.mean(theoretical_rho_list):.4f}, Max={np.max(theoretical_rho_list):.4f} (After H_scale={H_scale})")
-
-    # =========================================================
-    # 阶段一：调参阶段 (绝对外层全局搜索 + 连续热启动)
-    # =========================================================
-    if lambda_candidates is not None and len(lambda_candidates) > 0:
-        best_ic = float('inf')
-        best_lam = 0.0
-        sorted_lambdas = sorted(lambda_candidates, reverse=True)
-        
-        # 建立流动的全局热启动起点
-        current_theta_start = [th.copy() for th in init_theta_t]
-        current_p_start = [np.zeros((p, 1)) for _ in range(m)]
-        
-        for lam_cand in sorted_lambdas:
-            # 每一个 lam 都从上一个 lam 最终收敛的全局状态开始
-            th_temp = [th.copy() for th in current_theta_start]
-            p_temp = [p.copy() for p in current_p_start]
-            rho_temp = rho
-            
-            # 完整跑完 U-ADMM 的 T 轮代理构建
-            for t in range(T):
-                th_prev = [th.copy() for th in th_temp]
-                
-                agg_grad_list = [compute_agg_grad(j, th_temp, data) for j in range(m)]
-                th_temp, p_temp, rho_temp, _ = inner_admm(
-                    theta_t_list=th_temp, p_t_list=p_temp, agg_grad_list=agg_grad_list,
-                    H_rho_list=theoretical_rho_list, W=W_adj, rho=rho_temp,
-                    W_inner=W_inner, lam_t=lam_cand, project=(task == 'ranking')
-                )
-                
-                # 提早终止：由于步长松弛，外层通常 2-4 轮即可满足极小差异
-                max_diff = max(float(np.linalg.norm(th_temp[j] - th_prev[j])) for j in range(m))
-                if max_diff < 1e-4:
-                    break
-            
-            # 使用当前 lam 彻底收敛后的状态计算全局 BIC
-            ic_val = compute_ic(th_temp, data, ic_type=ic_type)
-            
-            if ic_val < best_ic:
-                best_ic = ic_val
-                best_lam = lam_cand
-                
-            # 用当前收敛点更新全局热启动池，喂给下一个更小的 lam
-            current_theta_start = th_temp
-            current_p_start = p_temp
-    else:
-        best_lam = lam_t
-
-    # =========================================================
-    # 阶段二：画图阶段 (使用全局最优 lambda 严格跑满 T 轮，记录完整历史)
-    # =========================================================
-    theta_t = [th.copy() for th in init_theta_t]
-    p_t = [np.zeros((p, 1)) for _ in range(m)]
-    current_rho = rho
-
     r0 = _record(theta_t)
     if verbose:
-        print(f'  [t=0 init]  RMSE={r0:.6f}, Selected best_lam={best_lam:.4f}')
+        print(f'  [t=0 init]  RMSE={r0:.6f}')
+        print(f'  [Theory Rho] Mean={np.mean(theoretical_rho_list):.4f}, Max={np.max(theoretical_rho_list):.4f}')
+
+    current_lam = lam_t
+    current_rho = rho
 
     for t in range(T):
         agg_grad_list = [compute_agg_grad(j, theta_t, data) for j in range(m)]
-        
-        theta_t, p_t, current_rho, debug_info = inner_admm(
-            theta_t_list=theta_t, p_t_list=p_t, agg_grad_list=agg_grad_list,
-            H_rho_list=theoretical_rho_list, W=W_adj, rho=current_rho,
-            W_inner=W_inner, lam_t=best_lam, project=(task == 'ranking')
-        )
-        
-        outer_debug = {
-            't': t,
-            'theta_t': [th.copy() for th in theta_t],
-            'p_t': [p.copy() for p in p_t],
-            'lam_t': best_lam,
-            'inner_debug': debug_info
-        }
-        history['debug'].append(outer_debug)
+        H_rho_list = theoretical_rho_list
+
+        if lambda_candidates is not None and len(lambda_candidates) > 0:
+            # 逐迭代 lambda 调参：每个外层 t 内，尝试所有 lambda，选 IC 最优
+            best_ic = float('inf')
+            best_theta_t = None
+            best_p_t = None
+            best_rho = None
+            best_lam = None
+            
+            for lam_cand in lambda_candidates:
+                cand_theta_t, cand_p_t, cand_rho = inner_admm(
+                    theta_t_list=theta_t, p_t_list=p_t,
+                    agg_grad_list=agg_grad_list,
+                    H_rho_list=H_rho_list, W=W_adj,
+                    rho=current_rho, W_inner=W_inner,
+                    lam_t=lam_cand, project=(task == 'ranking')
+                )
+                
+                ic_val = compute_ic(cand_theta_t, data, ic_type=ic_type)
+                if ic_val < best_ic:
+                    best_ic = ic_val
+                    best_theta_t = cand_theta_t
+                    best_p_t = cand_p_t
+                    best_rho = cand_rho
+                    best_lam = lam_cand
+            
+            theta_t = best_theta_t
+            p_t = best_p_t
+            current_rho = best_rho
+            current_lam = best_lam
+        else:
+            theta_t, p_t, current_rho = inner_admm(
+                theta_t_list=theta_t, p_t_list=p_t,
+                agg_grad_list=agg_grad_list,
+                H_rho_list=H_rho_list, W=W_adj,
+                rho=current_rho, W_inner=W_inner,
+                lam_t=current_lam, project=(task == 'ranking')
+            )
 
         r = _record(theta_t)
         if verbose:
-            print(f'  [t={t+1:2d}]  RMSE={r:.6f}, rho={current_rho:.4f}, lam_t={best_lam:.4f}')
+            if lambda_candidates is not None and len(lambda_candidates) > 0:
+                print(f'  [t={t+1:2d}]  RMSE={r:.6f}, best_lam={current_lam:.4f}, rho={current_rho:.4f}, {ic_type.upper()}={best_ic:.4f}')
+            else:
+                print(f'  [t={t+1:2d}]  RMSE={r:.6f}, lam_t={current_lam:.4f}, rho={current_rho:.4f}')
 
     return theta_t, theta_naive, history

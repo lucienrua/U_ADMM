@@ -81,9 +81,11 @@ from algorithms.admm import local_gd, compute_ic
 def run_global_u_erm(data, lr=0.5, n_iter=500, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False, tol=1e-5):
     """
     Pool (Global U-ERM): 中心化 Oracle 基线算法。
-    将所有 N=m*n 个样本汇总，计算真正的全局 U-统计量 (JMLR 2023 公式(3))。
+    使用二阶近似或拟牛顿法 (L-BFGS-B / SLSQP) 求解全局目标函数。
     对应 IEEE 2022 中 Global 的定义：全量数据集中计算。
     """
+    from scipy.optimize import minimize
+    
     task = data['task']
     p = data['p']
     m = data['m']
@@ -112,45 +114,112 @@ def run_global_u_erm(data, lr=0.5, n_iter=500, lambda_candidates=None, ic_type='
 
     if task == 'ranking':
         init = init_theta.copy() if init_theta is not None else np.ones((p, 1)) / np.sqrt(p)
-        project = True
     else:
         init = init_theta.copy() if init_theta is not None else np.zeros((p, 1))
-        project = False
         
-    def _step(theta, lam_val, current_lr):
-        g = gfn(theta)
-        v = theta - current_lr * g
-        if lam_val > 0:
-            v = soft_threshold(v, current_lr * lam_val)
-        if project:
-            v = _proj_sphere(v)
-            # 严格清理投影带来的浮点底噪，防止被梯度反复放大
-            v[np.abs(v) < 1e-5] = 0.0 
-        return v
+    def _solve_for_lambda(lam, current_init, record_history=False):
+        history_rmse = []
+        if record_history and theta_true is not None:
+            history_rmse.append(float(np.linalg.norm(current_init - theta_true)))
 
-    decay_interval = 100
-    decay_rate = 0.5
+        def callback(xk):
+            if record_history and theta_true is not None:
+                if lam > 0:
+                    th_k = (xk[:p] - xk[p:]).reshape(-1, 1)
+                else:
+                    th_k = xk.reshape(-1, 1)
+                
+                if task == 'ranking':
+                    # 即使未收敛，评估时也临时投影回球面
+                    nrm = np.linalg.norm(th_k)
+                    if nrm > 1e-12:
+                        th_k = th_k / nrm
+                history_rmse.append(float(np.linalg.norm(th_k - theta_true)))
+
+        if lam > 0:
+            # L1 正则化：使用变量拆分 theta = u - v, u>=0, v>=0
+            def obj_grad(x_ext):
+                u = x_ext[:p].reshape(-1, 1)
+                v = x_ext[p:].reshape(-1, 1)
+                theta = u - v
+                loss = lfn(theta)
+                grad = gfn(theta)
+                
+                obj = loss + lam * np.sum(u + v)
+                grad_u = grad.flatten() + lam
+                grad_v = -grad.flatten() + lam
+                return float(obj), np.concatenate([grad_u, grad_v])
+                
+            u0 = np.maximum(current_init.flatten(), 0)
+            v0 = np.maximum(-current_init.flatten(), 0)
+            x0 = np.concatenate([u0, v0])
+            bounds = [(0, None)] * (2 * p)
+            
+            if task == 'ranking':
+                constraints = {
+                    'type': 'eq',
+                    'fun': lambda x: np.sum((x[:p] - x[p:])**2) - 1.0,
+                    'jac': lambda x: np.concatenate([2 * (x[:p] - x[p:]), -2 * (x[:p] - x[p:])])
+                }
+                res = minimize(obj_grad, x0, method='SLSQP', jac=True, bounds=bounds, constraints=constraints, 
+                               options={'maxiter': n_iter, 'ftol': tol, 'disp': False}, callback=callback)
+            else:
+                res = minimize(obj_grad, x0, method='L-BFGS-B', jac=True, bounds=bounds, 
+                               options={'maxiter': n_iter, 'gtol': tol, 'disp': False}, callback=callback)
+                
+            theta_opt = (res.x[:p] - res.x[p:]).reshape(-1, 1)
+            
+        else:
+            def obj_grad(x):
+                theta = x.reshape(-1, 1)
+                return float(lfn(theta)), gfn(theta).flatten()
+                
+            x0 = current_init.flatten()
+            if task == 'ranking':
+                constraints = {
+                    'type': 'eq',
+                    'fun': lambda x: np.dot(x, x) - 1.0,
+                    'jac': lambda x: 2.0 * x
+                }
+                res = minimize(obj_grad, x0, method='SLSQP', jac=True, constraints=constraints, 
+                               options={'maxiter': n_iter, 'ftol': tol, 'disp': False}, callback=callback)
+            else:
+                res = minimize(obj_grad, x0, method='L-BFGS-B', jac=True, 
+                               options={'maxiter': n_iter, 'gtol': tol, 'disp': False}, callback=callback)
+                
+            theta_opt = res.x.reshape(-1, 1)
+
+        # 严格清理浮点底噪，保证 df 评估准确，并修复投影问题
+        if task == 'ranking':
+            theta_opt = _proj_sphere(theta_opt)
+        
+        theta_opt[np.abs(theta_opt) < 1e-5] = 0.0
+        
+        if task == 'ranking':
+            theta_opt = _proj_sphere(theta_opt)
+
+        if record_history and theta_true is not None:
+            target_len = 1 + n_iter
+            if len(history_rmse) > 0:
+                if len(history_rmse) < target_len:
+                    # Pad with the last value if converged early
+                    history_rmse.extend([history_rmse[-1]] * (target_len - len(history_rmse)))
+                elif len(history_rmse) > target_len:
+                    history_rmse = history_rmse[:target_len]
+
+        return theta_opt, history_rmse
 
     if lambda_candidates is not None and len(lambda_candidates) > 0:
         best_ic = float('inf')
         best_lam = 0.0
-        N_total = sum(data['X'][j].shape[0] for j in range(data['m']))
+        N_total = sum(data['X'][j].shape[0] for j in range(m))
         
         sorted_lambdas = sorted(lambda_candidates, reverse=True)
-        
-        # 🔴 核心修复 2：建立连续热启动起点
         current_init_theta = init.copy()
         
         for lam in sorted_lambdas:
-            # 使用上一个最优解作为本次的起点
-            theta_tmp = current_init_theta.copy()
-            
-            for t in range(n_iter):
-                current_lr = lr * (decay_rate ** (t // decay_interval))
-                # 🔴 核心修复 1：移除错误的 lam * H_scale
-                theta_tmp = _step(theta_tmp, lam, current_lr)
-            
-            # 🔴 核心修复 2：更新热启动起点
+            # 阶段一：不记录历史，快速调参
+            theta_tmp, _ = _solve_for_lambda(lam, current_init_theta, record_history=False)
             current_init_theta = theta_tmp.copy()
             
             loss_val = lfn(theta_tmp)
@@ -168,26 +237,12 @@ def run_global_u_erm(data, lr=0.5, n_iter=500, lambda_candidates=None, ic_type='
     else:
         best_lam = 0.0
 
-    # --- 阶段二：使用最佳 lambda 跑满并记录历史 ---
-    # 最终输出必须回退到统一起点，公平记录完整的收敛过程
-    best_theta = init.copy()
+    # 阶段二：使用最佳 lambda 跑满并记录历史
+    best_theta, best_history = _solve_for_lambda(best_lam, init, record_history=return_history)
     
     if return_history:
-        history = {'rmse': []}
-        if theta_true is not None:
-             history['rmse'].append(float(np.linalg.norm(best_theta - theta_true)))
-             
-        for t in range(n_iter):
-            current_lr = lr * (decay_rate ** (t // decay_interval))
-            best_theta = _step(best_theta, best_lam, current_lr)
-            if theta_true is not None:
-                history['rmse'].append(float(np.linalg.norm(best_theta - theta_true)))
-                
-        return best_theta, history
+        return best_theta, {'rmse': best_history}
     else:
-        for t in range(n_iter):
-            current_lr = lr * (decay_rate ** (t // decay_interval))
-            best_theta = _step(best_theta, best_lam, current_lr)
         return best_theta
 
 def run_dgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic', theta_init_list=None, return_history=False, tol=1e-4):

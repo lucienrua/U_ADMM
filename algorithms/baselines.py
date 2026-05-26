@@ -106,8 +106,11 @@ def run_global_u_erm(data, lr=0.5, n_iter=500, lambda_candidates=None, ic_type='
         delta_all = np.concatenate(data['delta'])
         Sigma = data['Sigma']
         
-        # 全量 Pooled: base_n = N_total, 生成 C(N,2) 个全局 Pairs
-        dX, dlogTt, r2, r, di, dj_idx, n_val = aft_pairs(X_all, logTt_all, delta_all, Sigma)
+        # 全量 Pooled: 生成 C(N,2) 个全局 Pairs
+        # 🔴 关键修复：带宽 base_n 必须用节点本地样本量 n（而非总样本量 N），
+        #    否则高斯核带宽窄 sqrt(m) 倍，导致 Φ(z) 饱和、梯度归零、信息量坍缩。
+        n_local = data['X'][0].shape[0]  # 每节点样本量 n
+        dX, dlogTt, r2, r, di, dj_idx, n_val = aft_pairs(X_all, logTt_all, delta_all, Sigma, base_n=n_local)
         
         gfn = lambda th: aft_grad(th, dX, dlogTt, r2, r, di, dj_idx, n_val)
         lfn = lambda th: aft_loss(th, dX, dlogTt, r2, r, di, dj_idx, n_val)

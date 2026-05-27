@@ -4,34 +4,51 @@ from utils.math_utils import soft_threshold, _proj_sphere
 from models.ranking import rank_grad, rank_loss, rank_hess, ranking_pairs
 from models.aft import aft_grad, aft_loss, aft_hess_diag, aft_pairs
 
-def local_gd(grad_fn, loss_fn, init_theta, n_iter=500, lr_init=0.5, project=False, lam=0.0, theta_true=None, project_end=False):
+def local_gd(grad_fn, loss_fn, init_theta, n_iter=20, lr_init=1.0, project=False, lam=0.0, theta_true=None, project_end=False, decay_rate=0.98):
     """
-    Proximal Gradient Descent with Armijo line search.
+    Proximal Gradient Descent with adaptive Armijo line search and early stopping.
     """
     theta = init_theta.copy()
     history = {'rmse': []}
     if theta_true is not None:
         record_th = _proj_sphere(theta) if project_end else theta
         history['rmse'].append(float(np.linalg.norm(record_th - theta_true)))
-    for _ in range(n_iter):
+        
+    alpha = lr_init
+    for step in range(n_iter):
         g = grad_fn(theta)
-        l0 = loss_fn(theta)
-        alpha = lr_init
-        for _ in range(25):
-            cand = theta - alpha * g
+        
+        cand = theta
+        if project:
+            # 对于非凸约束(如球面投影)，固定大步长容易在极小值附近震荡无法收敛。
+            # 引入步长衰减，保证其最终能够进入极小区域并触发早停。
+            current_alpha = lr_init * (decay_rate ** step)
+            cand = theta - current_alpha * g
             if lam > 0:
-                cand = soft_threshold(cand, alpha * lam)
-            if project: cand = _proj_sphere(cand)
+                cand = soft_threshold(cand, current_alpha * lam)
+            cand = _proj_sphere(cand)
+        else:
+            # Adaptive alpha for Armijo: start slightly larger than previous
+            alpha = min(lr_init, alpha * 1.5)
+            l0 = loss_fn(theta)  # 仅在需要线搜索时才计算 loss
+            for _ in range(25):
+                cand = theta - alpha * g
+                if lam > 0:
+                    cand = soft_threshold(cand, alpha * lam)
 
-            step_diff = cand - theta
-            if loss_fn(cand) <= l0 + float(np.sum(g * step_diff)) + (0.5/alpha) * np.sum(step_diff**2):
-                break
-            alpha *= 0.5
+                step_diff = cand - theta
+                if loss_fn(cand) <= l0 + float(np.sum(g * step_diff)) + (0.5/alpha) * np.sum(step_diff**2):
+                    break
+                alpha *= 0.5
 
-        cand = theta - alpha * g
-        if lam > 0:
-            cand = soft_threshold(cand, alpha * lam)
-        if project: cand = _proj_sphere(cand)
+        # Check early stopping before updating history
+        if np.linalg.norm(cand - theta) < 1e-4:
+            theta = cand
+            if theta_true is not None:
+                record_th = _proj_sphere(theta) if project_end else theta
+                history['rmse'].append(float(np.linalg.norm(record_th - theta_true)))
+            break
+            
         theta = cand
         if theta_true is not None:
             record_th = _proj_sphere(theta) if project_end else theta
@@ -96,7 +113,11 @@ def init_all_nodes(data):
             gfn = lambda th, dX=dX, dlogTt=dlogTt, r2=r2, r=r, di=di, dj=dj, n=n_val: aft_grad(th, dX, dlogTt, r2, r, di, dj, n)
             lfn = lambda th, dX=dX, dlogTt=dlogTt, r2=r2, r=r, di=di, dj=dj, n=n_val: aft_loss(th, dX, dlogTt, r2, r, di, dj, n)
             init = np.zeros((p, 1))
-            th = local_gd(gfn, lfn, init, n_iter=500, lr_init=0.5, project=False)
+            
+            # 添加经验局部惩罚系数以防止高维过拟合
+            n = data['X'][j].shape[0]
+            local_lam = 0.1 * np.sqrt(np.log(p) / n)
+            th = local_gd(gfn, lfn, init, n_iter=500, lr_init=0.5, project=False, lam=local_lam)
         theta0_list.append(th)
 
     theta_naive = np.mean(np.hstack(theta0_list), axis=1, keepdims=True)

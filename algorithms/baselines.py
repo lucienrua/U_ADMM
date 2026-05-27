@@ -4,6 +4,145 @@ from models.ranking import rank_grad, rank_loss, ranking_pairs
 from models.aft import aft_grad, aft_loss, aft_pairs
 from algorithms.admm import local_gd, compute_ic
 
+def _solve_local_node(gfn, lfn, init, lam, task, p, n_iter=500, tol=1e-5):
+    """
+    单节点求解器：使用与 Global 完全相同的优化引擎（L-BFGS-B / SLSQP + 变量拆分），
+    在单个节点的本地数据上求解带 L1 惩罚的 U-统计量 ERM。
+    """
+    from scipy.optimize import minimize
+
+    if task == 'ranking':
+        # 🔴 核心修复：完全抛弃 SLSQP，对于非凸球面约束使用近端梯度下降 (PGD)
+        theta_opt = local_gd(gfn, lfn, init, n_iter=n_iter, lr_init=1.0, project=True, lam=lam, decay_rate=1.0)
+    else:
+        if lam > 0:
+            # L1 正则化：变量拆分 theta = u - v, u>=0, v>=0
+            def obj_grad(x_ext):
+                u = x_ext[:p].reshape(-1, 1)
+                v = x_ext[p:].reshape(-1, 1)
+                theta = u - v
+                loss = lfn(theta)
+                grad = gfn(theta)
+                obj = loss + lam * np.sum(u + v)
+                grad_u = grad.flatten() + lam
+                grad_v = -grad.flatten() + lam
+                return float(obj), np.concatenate([grad_u, grad_v])
+
+            u0 = np.maximum(init.flatten(), 0)
+            v0 = np.maximum(-init.flatten(), 0)
+            x0 = np.concatenate([u0, v0])
+            bounds = [(0, None)] * (2 * p)
+
+            res = minimize(obj_grad, x0, method='L-BFGS-B', jac=True, bounds=bounds,
+                           options={'maxiter': n_iter, 'gtol': tol, 'disp': False})
+            theta_opt = (res.x[:p] - res.x[p:]).reshape(-1, 1)
+        else:
+            def obj_grad(x):
+                theta = x.reshape(-1, 1)
+                return float(lfn(theta)), gfn(theta).flatten()
+
+            x0 = init.flatten()
+            res = minimize(obj_grad, x0, method='L-BFGS-B', jac=True,
+                           options={'maxiter': n_iter, 'gtol': tol, 'disp': False})
+            theta_opt = res.x.reshape(-1, 1)
+
+    # 清理浮点底噪 + 投影
+    if task == 'ranking':
+        theta_opt = _proj_sphere(theta_opt)
+    theta_opt[np.abs(theta_opt) < 1e-5] = 0.0
+    if task == 'ranking':
+        theta_opt = _proj_sphere(theta_opt)
+    return theta_opt
+
+
+def run_local_penalized(data, lambda_candidates=None, ic_type='bic', init_theta_list=None, n_iter=500):
+    """
+    Penalized Local Estimator（带惩罚的局部估计量）。
+    每个节点独立求解带 L1 惩罚的 U-统计量 ERM，使用与 Global 完全相同的
+    单节点求解引擎 (_solve_local_node)。
+    优化引擎（L-BFGS-B / SLSQP + 变量拆分），区别仅在于数据范围为本地 n 个样本。
+    BIC 基于本地样本量 n 自动选择最优 lambda。
+
+    Returns
+    -------
+    theta_list : list of (p,1) arrays, 每个节点的带惩罚局部估计
+    theta_avg  : (p,1) array, 所有节点的带惩罚估计的简单平均 (即 Avg 基线)
+    """
+    task = data['task']
+    m = data['m']
+    p = data['p']
+
+    # 确保 precomputed_pairs 已存在
+    if 'precomputed_pairs' not in data:
+        data['precomputed_pairs'] = []
+        for j in range(m):
+            if task == 'ranking':
+                data['precomputed_pairs'].append(ranking_pairs(data['X'][j], data['Y'][j]))
+            else:
+                data['precomputed_pairs'].append(
+                    aft_pairs(data['X'][j], data['logTt'][j], data['delta'][j], data['Sigma']))
+
+    theta_list = []
+
+    for j in range(m):
+        # 构建本地损失函数和梯度函数
+        if task == 'ranking':
+            dX, S = data['precomputed_pairs'][j]
+            gfn = lambda th, dX=dX, S=S: rank_grad(th, dX, S)
+            lfn = lambda th, dX=dX, S=S: rank_loss(th, dX, S)
+        else:
+            dX, dlogTt, r2, r, di, dj, n_val = data['precomputed_pairs'][j]
+            gfn = lambda th, _dX=dX, _dlogTt=dlogTt, _r2=r2, _r=r, _di=di, _dj=dj, _n=n_val: \
+                aft_grad(th, _dX, _dlogTt, _r2, _r, _di, _dj, _n)
+            lfn = lambda th, _dX=dX, _dlogTt=dlogTt, _r2=r2, _r=r, _di=di, _dj=dj, _n=n_val: \
+                aft_loss(th, _dX, _dlogTt, _r2, _r, _di, _dj, _n)
+
+        # 初始点
+        if init_theta_list is not None:
+            init = init_theta_list[j].copy()
+        elif task == 'ranking':
+            init = np.ones((p, 1)) / np.sqrt(p)
+        else:
+            init = np.zeros((p, 1))
+
+        n_local = data['X'][j].shape[0]
+
+        # Lambda 选择：BIC 基于本地样本量 n
+        if lambda_candidates is not None and len(lambda_candidates) > 0:
+            best_ic = float('inf')
+            best_lam = 0.0
+            current_init = init.copy()
+
+            for lam in sorted(lambda_candidates, reverse=True):
+                theta_tmp = _solve_local_node(gfn, lfn, current_init, lam, task, p, n_iter=n_iter)
+                current_init = theta_tmp.copy()  # 连续热启动
+
+                loss_val = lfn(theta_tmp)
+                df = np.sum(np.abs(theta_tmp) > 1e-4)
+                avg_loss = max(loss_val, 1e-10)
+
+                if ic_type.lower() == 'aic':
+                    ic_val = np.log(avg_loss) + (2.0 / n_local) * df
+                else:
+                    ic_val = np.log(avg_loss) + (np.log(n_local) / n_local) * df
+
+                if ic_val < best_ic:
+                    best_ic = ic_val
+                    best_lam = lam
+        else:
+            best_lam = 0.0
+
+        best_theta = _solve_local_node(gfn, lfn, init, best_lam, task, p, n_iter=n_iter)
+        theta_list.append(best_theta)
+
+    # Avg = 所有带惩罚局部估计的简单算术平均
+    theta_avg = np.mean(np.hstack(theta_list), axis=1, keepdims=True)
+    if task == 'ranking':
+        theta_avg = _proj_sphere(theta_avg)
+
+    return theta_list, theta_avg
+
+
 # def run_global_u_erm(data, lr=0.5, n_iter=300, lambda_candidates=None, ic_type='bic', init_theta=None, return_history=False, tol=1e-5):
 #     """
 #     Pool (Global U-ERM): 将所有本地数据汇总到一台机器上。
@@ -120,77 +259,65 @@ def run_global_u_erm(data, lr=0.5, n_iter=500, lambda_candidates=None, ic_type='
     else:
         init = init_theta.copy() if init_theta is not None else np.zeros((p, 1))
         
-    def _solve_for_lambda(lam, current_init, record_history=False):
+    def _solve_for_lambda(lam, current_init, record_history=False, max_iter=None):
+        iters = max_iter if max_iter is not None else n_iter
         history_rmse = []
         if record_history and theta_true is not None:
-            history_rmse.append(float(np.linalg.norm(current_init - theta_true)))
+            init_for_record = _proj_sphere(current_init) if task == 'ranking' else current_init
+            history_rmse.append(float(np.linalg.norm(init_for_record - theta_true)))
 
-        def callback(xk):
+        if task == 'ranking':
+            # 使用近端梯度下降 (PGD) 求解非凸球面约束
+            result = local_gd(gfn, lfn, current_init, n_iter=iters, lr_init=1.0, project=True, lam=lam, theta_true=theta_true if record_history else None, project_end=True, decay_rate=1.0)
             if record_history and theta_true is not None:
-                if lam > 0:
-                    th_k = (xk[:p] - xk[p:]).reshape(-1, 1)
-                else:
-                    th_k = xk.reshape(-1, 1)
-                
-                if task == 'ranking':
-                    # 即使未收敛，评估时也临时投影回球面
-                    nrm = np.linalg.norm(th_k)
-                    if nrm > 1e-12:
-                        th_k = th_k / nrm
-                history_rmse.append(float(np.linalg.norm(th_k - theta_true)))
-
-        if lam > 0:
-            # L1 正则化：使用变量拆分 theta = u - v, u>=0, v>=0
-            def obj_grad(x_ext):
-                u = x_ext[:p].reshape(-1, 1)
-                v = x_ext[p:].reshape(-1, 1)
-                theta = u - v
-                loss = lfn(theta)
-                grad = gfn(theta)
-                
-                obj = loss + lam * np.sum(u + v)
-                grad_u = grad.flatten() + lam
-                grad_v = -grad.flatten() + lam
-                return float(obj), np.concatenate([grad_u, grad_v])
-                
-            u0 = np.maximum(current_init.flatten(), 0)
-            v0 = np.maximum(-current_init.flatten(), 0)
-            x0 = np.concatenate([u0, v0])
-            bounds = [(0, None)] * (2 * p)
-            
-            if task == 'ranking':
-                constraints = {
-                    'type': 'eq',
-                    'fun': lambda x: np.sum((x[:p] - x[p:])**2) - 1.0,
-                    'jac': lambda x: np.concatenate([2 * (x[:p] - x[p:]), -2 * (x[:p] - x[p:])])
-                }
-                res = minimize(obj_grad, x0, method='SLSQP', jac=True, bounds=bounds, constraints=constraints, 
-                               options={'maxiter': n_iter, 'ftol': tol, 'disp': False}, callback=callback)
+                theta_opt, hist_dict = result
+                history_rmse.extend(hist_dict['rmse'][1:])
             else:
+                theta_opt = result
+        else:
+            def callback(xk):
+                if record_history and theta_true is not None:
+                    if lam > 0:
+                        th_k = (xk[:p] - xk[p:]).reshape(-1, 1)
+                    else:
+                        th_k = xk.reshape(-1, 1)
+                    
+                    history_rmse.append(float(np.linalg.norm(th_k - theta_true)))
+
+            if lam > 0:
+                # L1 正则化：使用变量拆分 theta = u - v, u>=0, v>=0
+                def obj_grad(x_ext):
+                    u = x_ext[:p].reshape(-1, 1)
+                    v = x_ext[p:].reshape(-1, 1)
+                    theta = u - v
+                    loss = lfn(theta)
+                    grad = gfn(theta)
+                    
+                    obj = loss + lam * np.sum(u + v)
+                    grad_u = grad.flatten() + lam
+                    grad_v = -grad.flatten() + lam
+                    return float(obj), np.concatenate([grad_u, grad_v])
+                    
+                u0 = np.maximum(current_init.flatten(), 0)
+                v0 = np.maximum(-current_init.flatten(), 0)
+                x0 = np.concatenate([u0, v0])
+                bounds = [(0, None)] * (2 * p)
+                
                 res = minimize(obj_grad, x0, method='L-BFGS-B', jac=True, bounds=bounds, 
                                options={'maxiter': n_iter, 'gtol': tol, 'disp': False}, callback=callback)
+                    
+                theta_opt = (res.x[:p] - res.x[p:]).reshape(-1, 1)
                 
-            theta_opt = (res.x[:p] - res.x[p:]).reshape(-1, 1)
-            
-        else:
-            def obj_grad(x):
-                theta = x.reshape(-1, 1)
-                return float(lfn(theta)), gfn(theta).flatten()
-                
-            x0 = current_init.flatten()
-            if task == 'ranking':
-                constraints = {
-                    'type': 'eq',
-                    'fun': lambda x: np.dot(x, x) - 1.0,
-                    'jac': lambda x: 2.0 * x
-                }
-                res = minimize(obj_grad, x0, method='SLSQP', jac=True, constraints=constraints, 
-                               options={'maxiter': n_iter, 'ftol': tol, 'disp': False}, callback=callback)
             else:
+                def obj_grad(x):
+                    theta = x.reshape(-1, 1)
+                    return float(lfn(theta)), gfn(theta).flatten()
+                    
+                x0 = current_init.flatten()
                 res = minimize(obj_grad, x0, method='L-BFGS-B', jac=True, 
                                options={'maxiter': n_iter, 'gtol': tol, 'disp': False}, callback=callback)
-                
-            theta_opt = res.x.reshape(-1, 1)
+                    
+                theta_opt = res.x.reshape(-1, 1)
 
         # 严格清理浮点底噪，保证 df 评估准确，并修复投影问题
         if task == 'ranking':
@@ -220,9 +347,11 @@ def run_global_u_erm(data, lr=0.5, n_iter=500, lambda_candidates=None, ic_type='
         sorted_lambdas = sorted(lambda_candidates, reverse=True)
         current_init_theta = init.copy()
         
+        # 调参阶段使用较少迭代次数加速（正式跑阶段二时才用完整 n_iter）
+        tune_iters = max(n_iter // 4, 50)
         for lam in sorted_lambdas:
             # 阶段一：不记录历史，快速调参
-            theta_tmp, _ = _solve_for_lambda(lam, current_init_theta, record_history=False)
+            theta_tmp, _ = _solve_for_lambda(lam, current_init_theta, record_history=False, max_iter=tune_iters)
             current_init_theta = theta_tmp.copy()
             
             loss_val = lfn(theta_tmp)
@@ -491,8 +620,4 @@ def run_d_proxgd(data, T=500, lr=0.1, lambda_candidates=None, ic_type='bic',
 
     if return_history:
         return np.mean(theta, axis=0), hist_final
-    return np.mean(theta, axis=0)
-
-    if return_history:
-        return np.mean(theta, axis=0), hist_final
-    return np.mean(theta, axis=0)
+    return np.mean(theta, axis=0)

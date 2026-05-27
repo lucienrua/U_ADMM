@@ -10,8 +10,8 @@ import time
 import numpy as np
 from models.ranking import generate_ranking_data
 from models.aft import generate_aft_data
-from algorithms.admm import run_u_admm, init_all_nodes
-from algorithms.baselines import run_global_u_erm, run_dgd, run_d_proxgd
+from algorithms.admm import run_u_admm
+from algorithms.baselines import run_global_u_erm, run_dgd, run_d_proxgd, run_local_penalized
 from utils.eval_utils import evaluate_ranking_accuracy, calculate_metrics, evaluate_correlation, calculate_c_index
 
 def get_metrics_ranking(theta, theta_true, X, Y, quantiles, t_cost):
@@ -55,13 +55,11 @@ def run_single_ranking(seed, params):
     theta_true = d_rank['theta_true']
     X, Y, quantiles = d_rank['X'], d_rank['Y'], d_rank['quantiles']
     
-    # 【核心修复】统一执行一次热启动初始化，所有算法共享起点
-    theta0_list, theta_naive = init_all_nodes(d_rank)
-    
     result = {'seed': seed, 'noise_type': params['noise_type']}
     
     lambda_candidates = params.get('lambda_candidates', [0.1, 0.05, 0.01, 0.005, 0.001])
     lambda_global = params.get('lambda_global', lambda_candidates)
+    lambda_local = params.get('lambda_local', lambda_candidates)
     ic_type = params.get('ic_type', 'bic')
 
     run_U_ADMM = params.get('run_U_ADMM', True)
@@ -69,15 +67,21 @@ def run_single_ranking(seed, params):
     run_DGD = params.get('run_DGD', True)
     run_D_ProxGD = params.get('run_D_ProxGD', True)
 
-    # 1. 默认必跑：Avg 和 Local
-    # Avg: 对应初始化的平均值 (theta_naive)
-    result['Avg'] = get_metrics_ranking(theta_naive, theta_true, X, Y, quantiles, 0.0)
-    result['Avg']['theta_hat'] = theta_naive.flatten().tolist()
-    
-    # Local: RMSE等指标取所有节点的平均值 (以保证与算法初始起点完全对齐), 散点图的系数 theta_hat 取第一个节点
+    # 1. 默认必跑：Local (带 L1 惩罚 + BIC 选 λ) 和 Avg (带惩罚局部估计的均值)
+    #    Local 采用冷启动，其结果作为所有后续算法的统一起点
     t0 = time.time()
+    total_iters = params['T'] * params['W_inner']
+    local_pen_list, theta_avg_pen = run_local_penalized(
+        d_rank, lambda_candidates=lambda_local, ic_type=ic_type, n_iter=total_iters)
+    t_local = time.time() - t0
+
+    # Avg: 所有带惩罚局部估计的简单平均
+    result['Avg'] = get_metrics_ranking(theta_avg_pen, theta_true, X, Y, quantiles, 0.0)
+    result['Avg']['theta_hat'] = theta_avg_pen.flatten().tolist()
+    
+    # Local: 各节点带惩罚估计的指标均值
     local_rmses, local_maes, local_accs = [], [], []
-    for th in theta0_list:
+    for th in local_pen_list:
         m_dict = get_metrics_ranking(th, theta_true, X, Y, quantiles, 0)
         local_rmses.append(m_dict['RMSE'])
         local_maes.append(m_dict['MAE'])
@@ -85,12 +89,12 @@ def run_single_ranking(seed, params):
     result['Local'] = {
         'RMSE': float(np.mean(local_rmses)),
         'MAE': float(np.mean(local_maes)),
-        'F1_Score': float(np.mean([calculate_metrics(theta_true, th)['F1_Score'] for th in theta0_list])),
-        'Precision': float(np.mean([calculate_metrics(theta_true, th)['Precision'] for th in theta0_list])),
-        'Recall': float(np.mean([calculate_metrics(theta_true, th)['Recall'] for th in theta0_list])),
+        'F1_Score': float(np.mean([calculate_metrics(theta_true, th)['F1_Score'] for th in local_pen_list])),
+        'Precision': float(np.mean([calculate_metrics(theta_true, th)['Precision'] for th in local_pen_list])),
+        'Recall': float(np.mean([calculate_metrics(theta_true, th)['Recall'] for th in local_pen_list])),
         'Pairwise_Correlation': float(np.mean(local_accs)),
-        'Time': float(time.time() - t0),
-        'theta_hat': theta0_list[0].flatten().tolist()
+        'Time': float(t_local / params['m']),  # 平均每个节点的时间
+        'theta_hat': local_pen_list[0].flatten().tolist()
     }
 
     if run_U_ADMM:
@@ -100,7 +104,7 @@ def run_single_ranking(seed, params):
             rho=params['rho'], verbose=False,
             lambda_candidates=lambda_candidates,
             ic_type=ic_type,
-            theta0_list=theta0_list  # 传递热启动
+            theta0_list=local_pen_list  # 以带惩罚的 Local 为起点
         )
         t_uadmm = time.time() - t0
         result['U-ADMM'] = get_metrics_ranking(theta_u_r[0], theta_true, X, Y, quantiles, t_uadmm)
@@ -110,8 +114,8 @@ def run_single_ranking(seed, params):
     if run_Global:
         t0 = time.time()
         total_iters = params['T'] * params['W_inner']
-        # 传递 theta_naive 作为 Global 的初始化点
-        theta_global, hist_global = run_global_u_erm(d_rank, n_iter=total_iters, lambda_candidates=lambda_global, ic_type=ic_type, init_theta=theta_naive, return_history=True)
+        # 以带惩罚的 Avg 为 Global 的初始化点
+        theta_global, hist_global = run_global_u_erm(d_rank, n_iter=total_iters, lambda_candidates=lambda_global, ic_type=ic_type, init_theta=theta_avg_pen, return_history=True)
         t_global = time.time() - t0
         result['Global'] = get_metrics_ranking(theta_global, theta_true, X, Y, quantiles, t_global)
         result['Global']['hist_rmse'] = hist_global['rmse']
@@ -119,8 +123,8 @@ def run_single_ranking(seed, params):
         
     if run_DGD:
         t0 = time.time()
-        # 传递 theta0_list 作为 D-subGD 的初始分布
-        theta_dgd, hist_dgd = run_dgd(d_rank, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=theta0_list, return_history=True)
+        # 以带惩罚的 Local 为 D-subGD 的初始分布
+        theta_dgd, hist_dgd = run_dgd(d_rank, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=local_pen_list, return_history=True)
         t_dgd = time.time() - t0
         result['D-subGD'] = get_metrics_ranking(theta_dgd, theta_true, X, Y, quantiles, t_dgd)
         result['D-subGD']['hist_rmse'] = hist_dgd['rmse']
@@ -130,8 +134,8 @@ def run_single_ranking(seed, params):
         t0 = time.time()
         d_proxgd_lr = params.get('d_proxgd_lr', 0.1)
         d_proxgd_lambdas = params.get('lambda_d_proxgd', lambda_candidates)
-        # 传递 theta0_list 作为 D-ProxGD 的初始分布
-        theta_d_proxgd, hist_d_proxgd = run_d_proxgd(d_rank, T=params['T'] * params['W_inner'], lr=d_proxgd_lr, lambda_candidates=d_proxgd_lambdas, ic_type=ic_type, theta_init_list=theta0_list, return_history=True)
+        # 以带惩罚的 Local 为 D-ProxGD 的初始分布
+        theta_d_proxgd, hist_d_proxgd = run_d_proxgd(d_rank, T=params['T'] * params['W_inner'], lr=d_proxgd_lr, lambda_candidates=d_proxgd_lambdas, ic_type=ic_type, theta_init_list=local_pen_list, return_history=True)
         t_d_proxgd = time.time() - t0
         result['D-ProxGD'] = get_metrics_ranking(theta_d_proxgd, theta_true, X, Y, quantiles, t_d_proxgd)
         result['D-ProxGD']['hist_rmse'] = hist_d_proxgd['rmse']
@@ -148,13 +152,11 @@ def run_single_aft(seed, params):
     
     theta_true = d_aft['theta_true']
     
-    # 统一热启动
-    theta0_list, theta_naive = init_all_nodes(d_aft)
-    
     result = {'seed': seed, 'noise_type': params['noise_type']}
     
     lambda_candidates = params.get('lambda_candidates', [0.1, 0.05, 0.01, 0.005, 0.001])
     lambda_global = params.get('lambda_global', lambda_candidates)
+    lambda_local = params.get('lambda_local', lambda_candidates)
     ic_type = params.get('ic_type', 'bic')
 
     run_U_ADMM = params.get('run_U_ADMM', True)
@@ -162,13 +164,21 @@ def run_single_aft(seed, params):
     run_DGD = params.get('run_DGD', True)
     run_D_ProxGD = params.get('run_D_ProxGD', True)
 
-    # 1. 默认必跑：Avg 和 Local
-    result['Avg'] = get_metrics_aft(theta_naive, theta_true, d_aft, 0.0)
-    result['Avg']['theta_hat'] = theta_naive.flatten().tolist()
-    
+    # 1. 默认必跑：Local (带 L1 惩罚 + BIC 选 λ) 和 Avg (带惩罚局部估计的均值)
+    #    Local 采用冷启动，其结果作为所有后续算法的统一起点
     t0 = time.time()
+    total_iters = params['T'] * params['W_inner']
+    local_pen_list, theta_avg_pen = run_local_penalized(
+        d_aft, lambda_candidates=lambda_local, ic_type=ic_type, n_iter=total_iters)
+    t_local = time.time() - t0
+
+    # Avg: 所有带惩罚局部估计的简单平均
+    result['Avg'] = get_metrics_aft(theta_avg_pen, theta_true, d_aft, 0.0)
+    result['Avg']['theta_hat'] = theta_avg_pen.flatten().tolist()
+    
+    # Local: 各节点带惩罚估计的指标均值
     local_rmses, local_maes, local_c_indices = [], [], []
-    for th in theta0_list:
+    for th in local_pen_list:
         m_dict = get_metrics_aft(th, theta_true, d_aft, 0)
         local_rmses.append(m_dict['RMSE'])
         local_maes.append(m_dict['MAE'])
@@ -178,8 +188,8 @@ def run_single_aft(seed, params):
         'MAE': float(np.mean(local_maes)),
         'Pairwise_Correlation': float(np.mean(local_c_indices)),
         'C_Index': float(np.mean(local_c_indices)),
-        'Time': float(time.time() - t0),
-        'theta_hat': theta0_list[0].flatten().tolist()
+        'Time': float(t_local / params['m']),  # 平均每个节点的时间
+        'theta_hat': local_pen_list[0].flatten().tolist()
     }
 
     if run_U_ADMM:
@@ -189,7 +199,7 @@ def run_single_aft(seed, params):
             rho=params['rho'], verbose=False,
             lambda_candidates=lambda_candidates,
             ic_type=ic_type,
-            theta0_list=theta0_list
+            theta0_list=local_pen_list  # 以带惩罚的 Local 为起点
         )
         t_uadmm = time.time() - t0
         result['U-ADMM'] = get_metrics_aft(theta_u_a[0], theta_true, d_aft, t_uadmm)
@@ -199,7 +209,8 @@ def run_single_aft(seed, params):
     if run_Global:
         t0 = time.time()
         total_iters = params['T'] * params['W_inner']
-        theta_global, hist_global = run_global_u_erm(d_aft, n_iter=total_iters, lambda_candidates=lambda_global, ic_type=ic_type, init_theta=theta_naive, return_history=True)
+        # 以带惩罚的 Avg 为 Global 的初始化点
+        theta_global, hist_global = run_global_u_erm(d_aft, n_iter=total_iters, lambda_candidates=lambda_global, ic_type=ic_type, init_theta=theta_avg_pen, return_history=True)
         t_global = time.time() - t0
         result['Global'] = get_metrics_aft(theta_global, theta_true, d_aft, t_global)
         result['Global']['hist_rmse'] = hist_global['rmse']
@@ -207,7 +218,8 @@ def run_single_aft(seed, params):
         
     if run_DGD:
         t0 = time.time()
-        theta_dgd, hist_dgd = run_dgd(d_aft, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=theta0_list, return_history=True)
+        # 以带惩罚的 Local 为 D-subGD 的初始分布
+        theta_dgd, hist_dgd = run_dgd(d_aft, T=params['T'] * params['W_inner'], lr=0.1, lambda_candidates=lambda_candidates, ic_type=ic_type, theta_init_list=local_pen_list, return_history=True)
         t_dgd = time.time() - t0
         result['D-subGD'] = get_metrics_aft(theta_dgd, theta_true, d_aft, t_dgd)
         result['D-subGD']['hist_rmse'] = hist_dgd['rmse']
@@ -217,7 +229,8 @@ def run_single_aft(seed, params):
         t0 = time.time()
         d_proxgd_lr = params.get('d_proxgd_lr', 0.1)
         d_proxgd_lambdas = params.get('lambda_d_proxgd', lambda_candidates)
-        theta_d_proxgd, hist_d_proxgd = run_d_proxgd(d_aft, T=params['T'] * params['W_inner'], lr=d_proxgd_lr, lambda_candidates=d_proxgd_lambdas, ic_type=ic_type, theta_init_list=theta0_list, return_history=True)
+        # 以带惩罚的 Local 为 D-ProxGD 的初始分布
+        theta_d_proxgd, hist_d_proxgd = run_d_proxgd(d_aft, T=params['T'] * params['W_inner'], lr=d_proxgd_lr, lambda_candidates=d_proxgd_lambdas, ic_type=ic_type, theta_init_list=local_pen_list, return_history=True)
         t_d_proxgd = time.time() - t0
         result['D-ProxGD'] = get_metrics_aft(theta_d_proxgd, theta_true, d_aft, t_d_proxgd)
         result['D-ProxGD']['hist_rmse'] = hist_d_proxgd['rmse']

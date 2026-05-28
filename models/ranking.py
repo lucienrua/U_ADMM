@@ -69,7 +69,7 @@ def generate_ranking_data(m, n, p_prime, p, pc, noise_type='normal', rng_seed=No
     X_list, Y_list = [], []
     for _ in range(m):
         Xj = np.random.multivariate_normal(np.zeros(p), Sigma, n)  # (n, p)
-        # 【修改处 2】：在生成各节点实际的连续分数时，乘以 noise_scale
+        # 在生成各节点实际的连续分数时乘以噪声缩放系数。
         tj = Xj @ theta_true.flatten() + generate_noise(noise_type, n) * noise_scale 
         # searchsorted 实现分段函数 J：返回 {1,2,3,4,5}
         Yj = np.searchsorted(quantiles, tj, side='right') + 1       # (n,)
@@ -78,8 +78,8 @@ def generate_ranking_data(m, n, p_prime, p, pc, noise_type='normal', rng_seed=No
 
     return dict(m=m, n=n, p=p,
                 theta_true=theta_true,   # 真实参数 (p,1)
-                X=X_list,       # list of m arrays，m个节点，each (n,p)
-                Y=Y_list,       # list of m arrays, each (n,) in [5]
+                X=X_list,       # m 个节点的列表，每个形状为 (n, p)
+                Y=Y_list,       # m 个节点的列表，每个形状为 (n,)，取值范围为 [1, 5]
                 W=W,            # 邻接矩阵 (m,m)
                 G=G,            # NetworkX 图
                 quantiles=quantiles,     # 全局分位点 (4,)

@@ -116,7 +116,7 @@ def aft_pairs(X, logTt, delta, Sigma, base_n=None):
     dX = X[ii] - X[jj]
     dlogTt = logTt[jj] - logTt[ii]
     
-    # 【优化 3】：使用点乘加横向求和替代 einsum，强制调用 BLAS 库
+    # 使用点乘与横向求和替代 einsum 以调用底层 BLAS 库加速。
     r2 = np.maximum(np.sum((dX @ Sigma) * dX, axis=1) / base_n, 1e-8)
     
     r = np.sqrt(r2)
@@ -128,10 +128,10 @@ def aft_grad(theta, dX, dlogTt, r2, r, di, dj, n):
     de = dlogTt + (dX @ theta).flatten()
     z = de / r
     
-    # 【优化 2】：使用极速的 ndtr 替代 stats.norm.cdf
+    # 采用 ndtr 替代 stats.norm.cdf 以提升计算效率。
     Phi = sp_special.ndtr(z)
     
-    # 【优化 1】：将内存爆炸的广播机制转换为极致的矩阵向量乘法 (dX.T @ w)
+    # 将广播机制替换为矩阵向量乘法以优化内存占用并提升速度。
     w = di * Phi - dj * (1.0 - Phi)
     return (dX.T @ w).reshape(-1, 1) * 2.0 / (n * (n - 1))
 
@@ -139,7 +139,7 @@ def aft_hess_diag(theta, dX, dlogTt, r2, r, di, dj, n):
     de = dlogTt + (dX @ theta).flatten()
     z = de / r
     
-    # 【优化 2】：手写正态分布 PDF，绕过 scipy.stats 的对象开销
+    # 直接实现正态分布概率密度函数计算，避免对象调用的额外开销。
     # 2.5066282746310002 是 sqrt(2 * pi) 的精确值
     phi = np.exp(-0.5 * z**2) / 2.5066282746310002  
     
@@ -151,7 +151,7 @@ def aft_loss(theta, dX, dlogTt, r2, r, di, dj, n):
     de = dlogTt + (dX @ theta).flatten()
     z = de / r
     
-    # 【优化 2】：全面替换慢速函数
+    # 将慢速函数全面替换为高效实现。
     Phi = sp_special.ndtr(z)
     Phi_neg = sp_special.ndtr(-z)
     phi = np.exp(-0.5 * z**2) / 2.5066282746310002

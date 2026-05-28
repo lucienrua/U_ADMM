@@ -1,5 +1,5 @@
 import os
-# 🟢 终极并行加速：必须在 import numpy 之前锁死底层多线程！
+# 并行加速优化：必须在引入 numpy 之前限制底层多线程数量。
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'

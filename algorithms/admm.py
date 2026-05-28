@@ -28,7 +28,7 @@ def local_gd(grad_fn, loss_fn, init_theta, n_iter=20, lr_init=1.0, project=False
                 cand = soft_threshold(cand, current_alpha * lam)
             cand = _proj_sphere(cand)
         else:
-            # Adaptive alpha for Armijo: start slightly larger than previous
+            # Armijo 线搜索自适应步长：初始值略大于前一次迭代的步长
             alpha = min(lr_init, alpha * 1.5)
             l0 = loss_fn(theta)  # 仅在需要线搜索时才计算 loss
             for _ in range(25):
@@ -41,7 +41,7 @@ def local_gd(grad_fn, loss_fn, init_theta, n_iter=20, lr_init=1.0, project=False
                     break
                 alpha *= 0.5
 
-        # Check early stopping before updating history
+        # 在更新历史记录前检查是否达到早停条件
         if np.linalg.norm(cand - theta) < 1e-4:
             theta = cand
             if theta_true is not None:
@@ -159,14 +159,14 @@ def inner_admm(theta_t_list, p_t_list, agg_grad_list, H_rho_list, W,
     omega = [1.0 / (H_rho_list[j] + 2.0 * rho * dg[j]) for j in range(m)]
 
     for _ in range(W_inner):
-        # 1. Dual Update (公式 16a)
+        # 1. 对偶更新 (公式 16a)
         p_new = []
         for j in range(m):
             consensus_gap = sum(theta_w[j] - theta_w[k] for k in nb[j]) if nb[j] else np.zeros((p, 1))
             p_new.append(p_w[j] + rho * consensus_gap)
         p_w = p_new
 
-        # 2. Primal Update (公式 17)
+        # 2. 原始更新 (公式 17)
         theta_new = []
         for j in range(m):
             sum_nb = sum(theta_w[k] for k in nb[j]) if nb[j] else np.zeros((p, 1))
@@ -214,7 +214,7 @@ def compute_ic(theta_list, data, ic_type='bic'):
     
     if ic_type.lower() == 'aic':
         ic = np.log(avg_loss) + (2.0 / N_total) * df
-    else: # default to bic
+    else: # 默认使用 BIC 准则
         ic = np.log(avg_loss) + (np.log(N_total) / N_total) * df
     return ic
 

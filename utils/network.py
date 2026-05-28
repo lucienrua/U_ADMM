@@ -40,7 +40,7 @@ def generate_er_network(m, p_c):
 
     W = nx.to_numpy_array(G)
     
-    # Generate Metropolis-Hastings doubly stochastic weight matrix
+    # 生成 Metropolis-Hastings 双随机权重矩阵
     degrees = np.sum(W, axis=1)
     W_mh = np.zeros((m, m))
     for i in range(m):
